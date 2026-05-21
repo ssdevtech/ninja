@@ -861,6 +861,7 @@ def get_patch(repo: Path) -> str:
     return _sanitize_patch(diff_output)
 
 
+
 """Reserved substrings used by the final patch cleanup pass to handle rare
 edge-case outputs safely. Keeping this list centralized makes the safeguard
 easy to apply without complicating the main editing flow."""
@@ -2669,6 +2670,7 @@ def _suggest_targeted_test_command(repo: Path, patch: str) -> Optional[str]:
     return None
 
 
+
 def _patch_ship_blockers(patch: str, issue: str) -> List[str]:
     """Structural gaps that correlate with losing duels vs king."""
     if not patch.strip():
@@ -4286,6 +4288,8 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _score1 = _patch_duel_score(_patch1, _issue_text)
         _score2 = _patch_duel_score(_patch2, _issue_text)
 
+
+
         if _score2 > _score1 or (_score2 == _score1 and _n2 >= _n1):
             _result2["multishot_attempts"] = 2
             _result2["multishot_winner"] = "retry"
@@ -4421,13 +4425,15 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         Returns True when the loop should continue (a turn was queued); False
         means the caller can declare success. The order is:
             0. hail-mary — patch empty after everything: force one real edit
-            1. polish — drop low-signal hunks the model still emitted
-            2. syntax — quote any parser error back at the model
-            3. test — actually run the companion test if one exists; if it
+            1. syntax — quote any parser error back at the model
+            2. test — actually run the companion test if one exists; if it
                       fails, feed the failure tail back via build_test_fix_prompt
-            4. coverage-nudge — name issue-mentioned paths still untouched
-            5. criteria-nudge — name issue acceptance bullets not addressed
-            6. self-check — show the diff and ask "did you cover everything?"
+            1. polish — drop low-signal hunks the model still emitted
+            
+            
+            2. coverage-nudge — name issue-mentioned paths still untouched
+            3. criteria-nudge — name issue acceptance bullets not addressed
+            4. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle. Test fires AFTER syntax
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
@@ -4474,27 +4480,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # v20 edge — close the architectural hole at the empty-patch early
-        # exit. Hail-mary is exempt from the total-refinement cap because
-        # it's the only thing standing between us and a guaranteed-zero
-        # empty-patch result.
-        if not patch.strip():
-            if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
-                hail_mary_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_hail_mary_prompt(issue),
-                    "HAIL_MARY_QUEUED: patch empty at refinement gate",
-                )
-                return True
-            return False
-
-        # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
-        # Hard-stop if we've already used the cap (hail-mary doesn't count).
-        if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
-            return False
-
-        # Gate order: syntax → test → deletion → criteria → coverage → polish → self-check
+        # === NEW ORDERING: Syntax and Test Fixes prioritized ===
         # Correctness gates (ground-truth or structural) consume refinement budget
         # before cosmetic gates (polish), so we don't waste a capped turn on
         # low-signal hunk cleanup when a real failure is still present.
@@ -4529,6 +4515,35 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     f"TEST_FIX_QUEUED:\n  {test_path}",
                 )
                 return True
+
+
+
+        # v20 edge — close the architectural hole at the empty-patch early
+        # exit. Hail-mary is exempt from the total-refinement cap because
+        # it's the only thing standing between us and a guaranteed-zero
+        # empty-patch result.
+        if not patch.strip():
+            if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
+                hail_mary_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_hail_mary_prompt(issue),
+                    "HAIL_MARY_QUEUED: patch empty at refinement gate",
+                )
+                return True
+            return False
+
+        # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
+        # Hard-stop if we've already used the cap (hail-mary doesn't count).
+        if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
+            return False
+
+        # Gate order: syntax → test → deletion → criteria → coverage → polish → self-check
+        # Correctness gates (ground-truth or structural) consume refinement budget
+        # before cosmetic gates (polish), so we don't waste a capped turn on
+        # low-signal hunk cleanup when a real failure is still present.
+
+
 
         # Deletion gap: issue says remove/delete/replace but patch has no deletions.
         # Fires before criteria/coverage: a missing removal is a structural omission,
