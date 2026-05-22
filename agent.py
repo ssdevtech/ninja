@@ -131,8 +131,6 @@ MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still un
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_DELETION_NUDGES = 1    # surface missing removals when issue says delete/remove but patch has none
-MAX_IMPORT_NUDGES = 1      # detect unresolved imports and orphaned files that escape syntax check
-MAX_ARCHITECTURE_NUDGES = 1 # detect architectural integration issues (missing wiring, wrong patterns)
 MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted).
                                 # Raised 2→3 after fixing multishot timing bug (attempt 2 now has a
@@ -886,6 +884,48 @@ _EDGECASE_GUARDRAIL = (
 )
 
 
+def _strip_noop_rewrite_hunks(diff_output: str) -> str:
+    """Drop hunks whose added lines exactly equal the removed lines.
+
+    Solver sometimes "rewrites" a region by emitting `-foo` then `+foo` —
+    identical content via a sed/python rewrite that produced the same bytes.
+    `_strip_low_signal_hunks` catches blank/whitespace/comment-only hunks
+    but not this case; both sides are real code with no semantic delta, so
+    the hunk is scope-creep that adds nothing.
+    """
+    if not diff_output.strip():
+        return diff_output
+    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+    out: List[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        if not block.startswith("diff --git ") or "\n@@ " not in block:
+            out.append(block)
+            continue
+        parts = re.split(r"(?=^@@ )", block, flags=re.MULTILINE)
+        header = parts[0]
+        hunks = [chunk for chunk in parts[1:] if chunk]
+        substantive: List[str] = []
+        for hunk_text in hunks:
+            added: List[str] = []
+            removed: List[str] = []
+            for line in hunk_text.splitlines():
+                if line.startswith("+") and not line.startswith("+++"):
+                    added.append(line[1:].rstrip())
+                elif line.startswith("-") and not line.startswith("---"):
+                    removed.append(line[1:].rstrip())
+            if added and removed and added == removed:
+                continue
+            substantive.append(hunk_text)
+        if substantive:
+            out.append(header + "".join(substantive))
+    result = "".join(out)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
+
+
 def _sanitize_patch(diff_output: str) -> str:
     if not diff_output.strip():
         return diff_output
@@ -895,6 +935,7 @@ def _sanitize_patch(diff_output: str) -> str:
     cleaned = _strip_mode_metadata_lines(cleaned)
     cleaned = _strip_minified_content_diffs(cleaned)
     cleaned = _strip_low_signal_hunks(cleaned)
+    cleaned = _strip_noop_rewrite_hunks(cleaned)
 
     # Strip content lines containing safety-check trigger substrings while preserving diff headers intact.
     # Conservative guardrail for edge cases where incidental text would otherwise make a valid patch unusable.
@@ -2671,248 +2712,107 @@ def _suggest_targeted_test_command(repo: Path, patch: str) -> Optional[str]:
     return None
 
 
-def _check_import_references(patch: str, repo: Optional[Path] = None) -> List[str]:
-    """Detect cross-file import issues: invalid paths, missing exports, orphaned files.
-    
-    Runs after syntax check. Identifies imports in the patch that reference files
-    that don't exist (or weren't created), or new files that are created but never
-    imported. These slip through syntax checking but cause runtime failures.
-    
-    Returns list of issues found, empty if all imports resolve validly.
+_SCOPE_CREEP_TODO_RE = re.compile(r"^\+(?!\+\+)\s*(?://|#|/\*|--)\s*(?:TODO|FIXME|XXX|HACK)\b", re.IGNORECASE | re.MULTILINE)
+_SCOPE_CREEP_CONSOLE_RE = re.compile(r"^\+(?!\+\+)\s*console\.(?:log|debug|warn)\(", re.MULTILINE)
+_SCOPE_CREEP_PYPRINT_RE = re.compile(r"^\+(?!\+\+)\s*print\(\s*[\"']", re.MULTILINE)
+_SCOPE_CREEP_DBG_RE = re.compile(r"^\+(?!\+\+)\s*(?:dbg!\(|debugger\b)", re.MULTILINE)
+_SCOPE_CREEP_STUB_RE = re.compile(
+    r"^\+(?!\+\+)\s*(?:raise\s+NotImplementedError|throw\s+new\s+Error\(['\"]\s*(?:TODO|not\s+implemented|stub))",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _detect_patch_scope_creep(patch: str, issue: str) -> List[str]:
+    """Catch debug-scaffolding left behind in the patch's added lines.
+
+    Code-review style guides typically flag unfinished-looking artefacts:
+      - TODO / FIXME / XXX / HACK comments
+      - console.log / print / dbg! / debugger scratch
+      - NotImplementedError / Error('TODO') stubs
+
+    A pattern is only treated as scratch when the issue does NOT mention it
+    (an issue that says "add logging for X" makes a +console.log legitimate;
+    one that says "fix off-by-one in length()" does not). Fails open on any
+    error.
     """
-    issues: List[str] = []
-    try:
-        # Track files created by the patch
-        new_files = set(_patch_newly_created_files(patch))
-        changed_files = set(_patch_changed_files(patch))
-        
-        # Extract import statements from added lines and check if targets exist
-        import_patterns = [
-            re.compile(r'from\s+["\']([^"\']+)["\']\s+import'),  # Python: from "path" import
-            re.compile(r'import\s+["\']([^"\']+)["\']'),  # Python: import "path"
-            re.compile(r'import\s+\*\s+as\s+\w+\s+from\s+["\']([^"\']+)["\']'),  # TypeScript
-            re.compile(r'import\s+\{[^}]*\}\s+from\s+["\']([^"\']+)["\']'),  # TypeScript
-            re.compile(r'import\s+["\']([^"\']+)["\']'),  # JS dynamic import
-            re.compile(r'require\s*\(\s*["\']([^"\']+)["\']\s*\)'),  # CommonJS
-        ]
-        
-        for line in patch.splitlines():
-            if not line.startswith('+'):
-                continue
-            added_line = line[1:]
-            
-            # Skip comments and imports that are being removed
-            if added_line.strip().startswith('#') or added_line.strip().startswith('//'):
-                continue
-            
-            for pattern in import_patterns:
-                matches = pattern.findall(added_line)
-                for import_path in matches:
-                    # Skip relative paths that go outside repo or absolute imports
-                    if import_path.startswith('/') or import_path.startswith('http'):
-                        continue
-                    
-                    # Normalize the import path (remove .js/.ts extensions, etc)
-                    normalized = import_path.rstrip('/')
-                    
-                    # Check if it looks like an external module (npm/pip package)
-                    if '/' not in normalized and not normalized.startswith('.'):
-                        # External package import - assume valid
-                        continue
-                    
-                    # Check if imported file was created in patch or exists already
-                    found = False
-                    for new_file in new_files:
-                        # Match with and without extensions
-                        if (new_file == normalized or 
-                            new_file.startswith(normalized + '.') or
-                            new_file == normalized + '/index' or
-                            new_file.startswith(normalized + '/index.')):
-                            found = True
-                            break
-                    
-                    if not found and repo:
-                        # Check if file exists in repo already
-                        test_paths = [
-                            normalized,
-                            normalized + '.py',
-                            normalized + '.ts',
-                            normalized + '.tsx',
-                            normalized + '.js',
-                            normalized + '.jsx',
-                            normalized + '/index.py',
-                            normalized + '/index.ts',
-                            normalized + '/index.js',
-                        ]
-                        for test_path in test_paths:
-                            if (repo / test_path).exists():
-                                found = True
-                                break
-                    
-                    if not found:
-                        issues.append(f"unresolved_import: {import_path}")
-        
-        # Check for orphaned new files (created but never imported)
-        added_text_lower = _patch_added_text(patch).lower()
-        for new_file in new_files:
-            # Skip index files, config files, common non-exported files
-            if any(x in new_file.lower() for x in ['__pycache__', '.d.ts', 'test.', 'spec.', 'conftest']):
-                continue
-            
-            # Check if the file name appears in any import statement
-            file_stem = Path(new_file).stem
-            import_keywords = (f'"{new_file}"', f"'{new_file}'", f'"{file_stem}"', f"'{file_stem}'")
-            if not any(kw in added_text_lower for kw in import_keywords):
-                # New file not referenced anywhere - might be orphaned
-                issues.append(f"orphaned_file: {new_file}")
-        
-        return issues
-    except Exception:
-        # Validation errors don't block; return empty
+    if not patch.strip():
         return []
+    issue_lower = issue.lower()
+    findings: List[str] = []
+    if "todo" not in issue_lower and "fixme" not in issue_lower:
+        if _SCOPE_CREEP_TODO_RE.search(patch):
+            findings.append("added_todo_or_fixme_comment")
+    if "console.log" not in issue_lower and " log" not in issue_lower and "logging" not in issue_lower:
+        if _SCOPE_CREEP_CONSOLE_RE.search(patch):
+            findings.append("added_console_log_scratch")
+    if "print(" not in issue_lower and "print statement" not in issue_lower and "debug" not in issue_lower:
+        if _SCOPE_CREEP_PYPRINT_RE.search(patch):
+            findings.append("added_python_print_scratch")
+    if "debugger" not in issue_lower and "dbg!" not in issue_lower:
+        if _SCOPE_CREEP_DBG_RE.search(patch):
+            findings.append("added_dbg_or_debugger_scratch")
+    if "notimplemented" not in issue_lower and "stub" not in issue_lower:
+        if _SCOPE_CREEP_STUB_RE.search(patch):
+            findings.append("added_stub_placeholder")
+    return findings
 
 
-def _check_architecture_integration(patch: str, repo: Optional[Path] = None) -> List[str]:
-    """Detect architectural integration issues: missing wiring, wrong patterns, anti-patterns.
-    
-    Validates that new files are properly integrated with parent components, that
-    code follows expected patterns (e.g., form action signatures in Next.js), and
-    that critical functions aren't removed without replacement. These catch higher-
-    level design issues that syntax and import validation miss.
-    
-    Returns list of issues found, empty if all valid.
+def _detect_broken_files_post_patch(patch: str, repo: Optional[Path]) -> List[str]:
+    """Post-patch sanity: re-parse every touched data/script file.
+
+    Catches two breakage modes the stdlib can detect locally:
+      - Python files that no longer parse (ast.parse SyntaxError)
+      - JSON files that no longer parse (json.loads raises)
+
+    Both common after a botched sed or boundary-mismatched edit, and both
+    leave the file in a clearly broken state that any later tool refuses.
+    Surfacing them as a structural blocker triggers one refinement turn to
+    clean up before final.
+
+    Fails open: any read error or missing file is treated as 'looks fine'
+    so transient FS hiccups don't falsely block a real patch.
     """
-    issues: List[str] = []
-    try:
-        new_files = set(_patch_newly_created_files(patch))
-        changed_files = set(_patch_changed_files(patch))
-        patch_text = patch.lower()
-        added_text = _patch_added_text(patch).lower()
-        removed_text = _patch_removed_text(patch)
-        
-        # Skip empty patches
-        if not new_files and not changed_files:
-            return []
-        
-        # === Pattern 1: New component files must be imported somewhere ===
-        # Components (PascalCase .tsx/.jsx files) should be imported if created
-        for new_file in new_files:
-            if not new_file.endswith(('.tsx', '.jsx', '.ts', '.js')):
-                continue
-            
-            file_stem = Path(new_file).stem
-            is_component = (new_file[0].isupper() or new_file.startswith('_'))
-            
-            # Skip test/config files
-            if any(x in new_file.lower() for x in ['test.', 'spec.', 'config.', 'types.', 'schema.']):
-                continue
-            
-            # Check if component/module is referenced in patch
-            # Look for: import statements, JSX usage, function calls
-            reference_patterns = [
-                f'import.*{file_stem}',
-                f"import.*['\"].*{new_file}",
-                f'<{file_stem}',  # JSX component usage
-                f'new {file_stem}',  # Class instantiation
-                f'from.*["\'].*{new_file}',
-            ]
-            found = any(re.search(p, added_text, re.IGNORECASE) for p in reference_patterns)
-            
-            if is_component and not found:
-                issues.append(f"architecture_unused_component: {new_file} created but never referenced")
-            elif not is_component and new_file.endswith(('.ts', '.js')) and not found:
-                # Utility/module files should be imported too, unless they're explicitly libraries
-                if not any(x in new_file.lower() for x in ['lib', 'utils', 'helper', 'constant']):
-                    if 'export' in added_text or 'function' in added_text:
-                        issues.append(f"architecture_unused_module: {new_file} exports code but not imported")
-        
-        # === Pattern 2: New Page/Route files need parent wiring ===
-        # If creating page.tsx/page.jsx, verify it's in app/pages structure and parent imports it
-        for new_file in new_files:
-            if new_file.endswith('page.tsx') or new_file.endswith('page.jsx'):
-                # Pages must be in recognized directories
-                if not any(x in new_file.lower() for x in ['app/', 'pages/', 'src/', 'routes/']):
-                    issues.append(f"architecture_wrong_page_location: {new_file} page not in app/pages/src")
-                
-                # For Next.js app router, pages should be in /app/* or /pages/*
-                if new_file.endswith('page.tsx'):  # Next.js pattern
-                    if 'app/' not in new_file and 'pages/' not in new_file:
-                        issues.append(f"architecture_wrong_app_structure: {new_file} should be in app/ directory")
-        
-        # === Pattern 3: Detect Server Actions with wrong signatures ===
-        # Next.js server actions used as form actions must accept (formData: FormData)
-        for new_file in new_files:
-            if new_file.endswith('.ts') or new_file.endswith('.tsx'):
-                # Look for function definitions
-                for line in added_text.split('\n'):
-                    if 'use server' in line or ('export' in line and 'function' in line):
-                        # Check if it looks like a server action
-                        # They should take FormData or specific params, not (id, formData)
-                        if re.search(r'function\s+\w+\s*\(\s*id\s*,\s*formData', line):
-                            issues.append(f"architecture_wrong_server_action: {new_file} has form action with (id, formData) signature")
-        
-        # === Pattern 4: Critical functions removed without replacement ===
-        # Don't remove core functions like destroy(), init(), render(), etc.
-        # unless they're being replaced
-        critical_patterns = [
-            (r'destroy\s*\(\s*\)', 'destroy'),
-            (r'componentWillUnmount\s*\(\s*\)', 'componentWillUnmount'),
-            (r'cleanup\s*\(\s*\)', 'cleanup'),
-        ]
-        
-        for pattern, func_name in critical_patterns:
-            removed_funcs = re.findall(r'-\s*(?:async\s+)?(?:private\s+)?(?:static\s+)?' + pattern, removed_text)
-            if removed_funcs:
-                # Check if it's being re-added (replacement) or just deleted
-                added_funcs = re.findall(r'\+\s*(?:async\s+)?(?:private\s+)?(?:static\s+)?' + pattern, patch)
-                if not added_funcs:
-                    # Function removed without replacement - might be wrong
-                    # (but don't error strongly; let tests catch if it's actually wrong)
-                    issues.append(f"architecture_critical_removed: {func_name}() removed without replacement")
-        
-        # === Pattern 5: Structural regression checks ===
-        # Verify we're not doing obviously wrong things
-        
-        # Don't remove all export statements from a module (would break imports)
-        for changed_file in changed_files:
-            if changed_file.endswith(('.ts', '.js', '.tsx', '.jsx')):
-                # Get the diff for this file
-                file_diff = _patch_for_file(patch, changed_file)
-                if file_diff:
-                    exports_removed = len(re.findall(r'^-.*export\s+', file_diff, re.MULTILINE))
-                    exports_added = len(re.findall(r'^\+.*export\s+', file_diff, re.MULTILINE))
-                    
-                    # If removing many exports but adding none, might be wrong
-                    if exports_removed > 3 and exports_added == 0:
-                        issues.append(f"architecture_removed_exports: {changed_file} removes {exports_removed} exports")
-        
-        return issues
-    except Exception:
-        # Validation errors don't block; return empty
+    if not patch.strip() or repo is None:
         return []
-
-
-def _patch_for_file(patch: str, filename: str) -> str:
-    """Extract the diff section for a specific file from patch."""
-    lines = []
-    in_file = False
-    for line in patch.split('\n'):
-        if line.startswith(f'diff --git a/{filename} b/{filename}'):
-            in_file = True
-        elif line.startswith('diff --git a/') and in_file:
+    import ast
+    broken: List[str] = []
+    for path in _patch_changed_files(patch):
+        if not path:
+            continue
+        full = repo / path
+        try:
+            if not full.is_file():
+                continue
+            text = full.read_text(errors="replace")
+        except Exception:
+            continue
+        low = path.lower()
+        if low.endswith(".py"):
+            try:
+                ast.parse(text)
+            except SyntaxError:
+                broken.append(f"py-syntax:{path}")
+            except Exception:
+                continue
+        elif low.endswith(".json"):
+            try:
+                json.loads(text)
+            except Exception:
+                broken.append(f"json-parse:{path}")
+        if len(broken) >= 4:
             break
-        elif in_file:
-            lines.append(line)
-    return '\n'.join(lines)
-
-
-def _patch_removed_text(patch: str) -> str:
-    """Extract all removed lines from patch."""
-    return '\n'.join(line[1:] for line in patch.split('\n') if line.startswith('-') and not line.startswith('---'))
+    return broken
 
 
 def _patch_ship_blockers(patch: str, issue: str) -> List[str]:
-    """Structural gaps that correlate with losing duels vs king."""
+    """Structural gaps that correlate with weak patches.
+
+    The advisory probes (debug_scratch_scope_creep + broken_files_post_patch)
+    travel via _emit_patch_quality_hints() instead of gating ship — false
+    positives on legitimate `print`/`console.log` edits and intentionally
+    non-parseable test fixtures were masking otherwise-strong patches
+    behind weaker fallbacks. Hard structural gaps below still block.
+    """
     if not patch.strip():
         return ["empty_patch"]
     blockers: List[str] = []
@@ -2925,6 +2825,31 @@ def _patch_ship_blockers(patch: str, issue: str) -> List[str]:
     if len(_unaddressed_criteria(patch, issue)) >= 2:
         blockers.append("criteria_mostly_unaddressed")
     return blockers
+
+
+def _emit_patch_quality_hints(
+    diff_text: str,
+    task_brief: str,
+    repo_root: Optional[Path] = None,
+) -> List[str]:
+    """Non-blocking patch-quality probes — surface concerns to the model via
+    refinement bootstrap without gating ship. The two probes here proved too
+    eager when used as hard blockers: pylint/JS tasks routinely add or remove
+    `print` / `console.log`, and ast.parse / json.loads reject perfectly valid
+    deltas when a touched file is partial or intentionally non-parseable in
+    test fixtures. As hints, they nudge the model on next attempt without
+    sinking the current one."""
+    hints: List[str] = []
+    if not diff_text.strip():
+        return hints
+    creep = _detect_patch_scope_creep(diff_text, task_brief)
+    if creep:
+        hints.append("debug_scratch_scope_creep: " + ",".join(creep[:3]))
+    if repo_root is not None:
+        broken = _detect_broken_files_post_patch(diff_text, repo_root)
+        if broken:
+            hints.append("broken_files_post_patch: " + ",".join(broken[:3]))
+    return hints
 
 
 def _patch_hunk_signature(patch: str) -> "frozenset":
@@ -4624,15 +4549,6 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                 diverged = _diverge_patch(result["patch"])
                 if diverged != result["patch"]:
                     result["patch"] = diverged
-                
-                # Final syntax check: catch errors that bypassed refinement gates
-                # because syntax_fix_turns_used already hit its cap. After the
-                # solve loop, refinement gates can't fire anymore, so a patch with
-                # latent syntax errors reaches here undetected. This gate logs them.
-                if _multishot_repo_obj is not None:
-                    final_syntax_errors = _check_syntax(_multishot_repo_obj, result["patch"])
-                    if final_syntax_errors:
-                        result["_final_syntax_errors"] = final_syntax_errors
         except Exception:
             pass
         return result
@@ -4689,6 +4605,14 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             _bootstrap += (
                 "\nAttempt-1 ship blockers to fix on retry: "
                 + ", ".join(_attempt1_blockers)
+                + "\n"
+            )
+        _attempt1_advisories = _emit_patch_quality_hints(_patch1, _issue_text, _multishot_repo_obj)
+        if _attempt1_advisories:
+            _bootstrap += (
+                "\nAttempt-1 quality hints (not blockers — address only if they "
+                "represent unintended additions): "
+                + ", ".join(_attempt1_advisories)
                 + "\n"
             )
         _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap})
@@ -4811,8 +4735,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     self_check_turns_used = 0
     syntax_fix_turns_used = 0
     test_fix_turns_used = 0
-    import_nudges_used = 0
-    architecture_nudges_used = 0
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     hail_mary_turns_used = 0
@@ -4884,7 +4806,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, import_nudges_used, architecture_nudges_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used
         patch = get_patch(repo)
 
         # === NEW (P1 #3): Adaptive refinement gating =========================
@@ -4960,53 +4882,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     assistant_text,
                     build_syntax_fix_prompt(syntax_errors),
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
-                )
-                return True
-
-        # Cross-file import validation: detect unresolved imports and orphaned files.
-        # Runs after syntax check so we know the code parses. Import errors cause
-        # test failures but agent can't fix without knowing the problem. This gate
-        # surfaces import issues before running tests.
-        if import_nudges_used < MAX_IMPORT_NUDGES:
-            import_issues = _check_import_references(patch, repo)
-            if import_issues:
-                import_nudges_used += 1
-                total_refinement_turns_used += 1
-                must_edit_after_gap = True
-                must_edit_patch = patch
-                prompt = (
-                    "Import validation found issues in the patch:\n  "
-                    + "\n  ".join(import_issues[:5])
-                    + "\n\nResolve each one: add missing files, fix import paths, or remove unused files."
-                )
-                queue_refinement_turn(
-                    assistant_text,
-                    prompt,
-                    "IMPORT_VALIDATION_QUEUED:\n  " + " | ".join(import_issues[:3]),
-                )
-                return True
-
-        # Architecture integration validation: detect missing wiring, anti-patterns, wrong styles.
-        # Runs after imports validated. Catches higher-level design issues: components not wired
-        # to parents, wrong file locations, wrong function signatures. These escape syntax/import
-        # checks but fail at architecture/design level. Nudge early so model can fix intent.
-        if architecture_nudges_used < MAX_ARCHITECTURE_NUDGES:
-            arch_issues = _check_architecture_integration(patch, repo)
-            if arch_issues:
-                architecture_nudges_used += 1
-                total_refinement_turns_used += 1
-                must_edit_after_gap = True
-                must_edit_patch = patch
-                prompt = (
-                    "Architecture validation found design issues:\n  "
-                    + "\n  ".join(arch_issues[:5])
-                    + "\n\nFix these: ensure new components are imported in parent files, "
-                    + "verify file locations match expected structure, check function signatures match usage patterns."
-                )
-                queue_refinement_turn(
-                    assistant_text,
-                    prompt,
-                    "ARCHITECTURE_VALIDATION_QUEUED:\n  " + " | ".join(arch_issues[:3]),
                 )
                 return True
 
