@@ -861,7 +861,6 @@ def get_patch(repo: Path) -> str:
     return _sanitize_patch(diff_output)
 
 
-
 """Reserved substrings used by the final patch cleanup pass to handle rare
 edge-case outputs safely. Keeping this list centralized makes the safeguard
 easy to apply without complicating the main editing flow."""
@@ -2670,7 +2669,6 @@ def _suggest_targeted_test_command(repo: Path, patch: str) -> Optional[str]:
     return None
 
 
-
 def _patch_ship_blockers(patch: str, issue: str) -> List[str]:
     """Structural gaps that correlate with losing duels vs king."""
     if not patch.strip():
@@ -2685,6 +2683,91 @@ def _patch_ship_blockers(patch: str, issue: str) -> List[str]:
     if len(_unaddressed_criteria(patch, issue)) >= 2:
         blockers.append("criteria_mostly_unaddressed")
     return blockers
+
+
+def _patch_hunk_signature(patch: str) -> "frozenset":
+    """Build a normalized hunk-set signature for clustering.
+
+    Returns a frozenset of (path, removed_hash, added_hash) tuples — one
+    per hunk in the patch. Two patches with the same signature have made
+    semantically equivalent edits (same files, same removed lines, same
+    added lines, modulo trailing-whitespace and order).
+    """
+    if not patch.strip():
+        return frozenset()
+    out = []
+    current_path = None
+    current_removed: List[str] = []
+    current_added: List[str] = []
+
+    def _flush():
+        if current_path and (current_removed or current_added):
+            r_h = hash("\n".join(l.rstrip() for l in current_removed))
+            a_h = hash("\n".join(l.rstrip() for l in current_added))
+            out.append((current_path, r_h, a_h))
+
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            _flush()
+            current_removed = []
+            current_added = []
+            m = re.match(r"diff --git a/.+? b/(.+?)$", line)
+            current_path = m.group(1) if m else None
+        elif line.startswith("@@"):
+            _flush()
+            current_removed = []
+            current_added = []
+        elif line.startswith("-") and not line.startswith("---"):
+            current_removed.append(line[1:])
+        elif line.startswith("+") and not line.startswith("+++"):
+            current_added.append(line[1:])
+    _flush()
+    return frozenset(out)
+
+
+def _signature_jaccard(a: "frozenset", b: "frozenset") -> float:
+    """Jaccard similarity between two hunk signatures."""
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+
+def _cluster_patches(candidates: List[Tuple[str, str]]) -> List[List[int]]:
+    """Union-find clustering by Jaccard >= 0.75 on hunk signatures.
+
+    candidates: list of (label, patch). Returns list of clusters (each
+    a list of indices into candidates).
+    """
+    n = len(candidates)
+    if n == 0:
+        return []
+    sigs = [_patch_hunk_signature(p) for _, p in candidates]
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x: int, y: int) -> None:
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[ry] = rx
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _signature_jaccard(sigs[i], sigs[j]) >= 0.75:
+                union(i, j)
+
+    clusters: Dict[int, List[int]] = {}
+    for i in range(n):
+        clusters.setdefault(find(i), []).append(i)
+    return list(clusters.values())
 
 
 def _patch_duel_score(patch: str, issue: str) -> int:
@@ -2972,6 +3055,81 @@ def _patch_has_deletions(patch: str) -> bool:
 def _issue_requires_deletion(issue_text: str) -> bool:
     """True if the issue contains explicit removal/replacement verbs."""
     return bool(_DELETION_VERB_RE.search(issue_text))
+
+
+_DELETION_TARGET_RE = re.compile(
+    r"\b(?:remove|delete|drop|eliminate|deprecate|strip|unlink|erase|disable|deactivate)\s+"
+    r"(?:(?:the|all|any|old|legacy|existing|unused|deprecated|unnecessary|stale|now-unused)\s+){0,3}"
+    r"([A-Za-z][A-Za-z0-9_./-]{2,80}(?:\.[A-Za-z]{2,8})?)",
+    re.IGNORECASE,
+)
+_DELETION_STOP_TOKENS = {
+    "the", "a", "an", "all", "any", "from", "to", "in", "on", "of",
+    "and", "or", "with", "without", "this", "that", "these", "those",
+    "support", "section", "method", "function", "code", "logic",
+    "feature", "page", "field", "value", "key", "test", "tests",
+    "import", "imports", "module", "type", "comment", "line", "lines",
+    "legacy", "deprecated", "old", "existing", "unused", "stale",
+    "obsolete", "previous", "former", "redundant", "duplicate",
+    "entire", "whole", "every", "each", "some", "few", "many",
+}
+
+
+def _extract_deletion_targets(issue_text: str) -> List[str]:
+    """Names that follow deletion verbs in the issue ("delete X", "remove Y").
+    Filters obvious stop tokens.
+    """
+    if not issue_text:
+        return []
+    out: List[str] = []
+    seen: set = set()
+    for m in _DELETION_TARGET_RE.finditer(issue_text):
+        raw = m.group(1).strip(".,;:")
+        if not raw:
+            continue
+        stem = raw.split(".")[0].lower()
+        if stem in _DELETION_STOP_TOKENS or len(raw) < 4:
+            continue
+        norm = raw.lower()
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(raw)
+        if len(out) >= 8:
+            break
+    return out
+
+
+def _patch_deletion_text(patch: str) -> str:
+    """Concatenated text of all substantive deletion lines, lowercased."""
+    out: List[str] = []
+    for line in patch.splitlines():
+        if line.startswith("-") and not line.startswith("---"):
+            content = line[1:]
+            if content.strip():
+                out.append(content)
+    return "\n".join(out).lower()
+
+
+def _named_deletions_unsatisfied(patch: str, issue_text: str) -> List[str]:
+    """Named deletion targets from the issue that don't appear in any
+    deletion line of the patch.
+    """
+    targets = _extract_deletion_targets(issue_text)
+    if not targets:
+        return []
+    deleted_text = _patch_deletion_text(patch)
+    changed_files_lower = [p.lower() for p in _patch_changed_files(patch)]
+    missing: List[str] = []
+    for t in targets:
+        t_lower = t.lower()
+        stem = t_lower.split(".")[0]
+        if t_lower in deleted_text or (len(stem) >= 4 and stem in deleted_text):
+            continue
+        if any(t_lower in p or stem in p for p in changed_files_lower):
+            continue
+        missing.append(t)
+    return missing
 
 
 def _issue_implies_relocation(issue_text: str) -> bool:
@@ -4273,7 +4431,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
-        _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
+        _attempt2_budget = max(30.0, min(70.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE - 50.0))
         _bootstrap = build_attempt2_bootstrap(_result1, _n1)
         _attempt1_blockers = _patch_ship_blockers(_patch1, _issue_text)
         if _attempt1_blockers:
@@ -4285,25 +4443,62 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _result2 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt2_budget, "_prior_attempt_summary": _bootstrap})
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
-        _score1 = _patch_duel_score(_patch1, _issue_text)
-        _score2 = _patch_duel_score(_patch2, _issue_text)
 
+        # Attempt 3: only if remaining budget allows AND attempt 2 produced
+        # something different from attempt 1 (otherwise no clustering signal
+        # to be gained from a 3rd sample on the same fixed point).
+        _elapsed = time.monotonic() - _multishot_started
+        _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
+        _result3 = None
+        _patch3 = ""
+        if _remaining >= _MULTISHOT_MIN_ATTEMPT_RESERVE + 25.0:
+            if _multishot_repo_obj is not None:
+                _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+            _attempt3_budget = max(25.0, min(55.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE))
+            _bootstrap3 = (
+                build_attempt2_bootstrap(_result2 if _n2 >= _n1 else _result1, max(_n1, _n2))
+                + "\nA third independent attempt — pick the file/function "
+                  "you are MOST confident about and execute the minimum "
+                  "surgical change there. Avoid the failure modes of the "
+                  "prior attempts.\n"
+            )
+            _result3 = _solve_attempt(**{**kwargs, "_wall_clock_budget": _attempt3_budget, "_prior_attempt_summary": _bootstrap3})
+            _patch3 = _result3.get("patch", "") or ""
 
+        # Cluster-mode selection: signature each non-empty patch, cluster
+        # by Jaccard ≥ 0.75 on hunk-set, pick representative of largest
+        # cluster. Tiebreak: max _patch_duel_score; then shorter patch.
+        candidates: List[Tuple[str, Dict[str, Any], str, int, int]] = []
+        for label, res, patch in (("primary", _result1, _patch1), ("retry", _result2, _patch2)):
+            if patch.strip():
+                candidates.append((label, res, patch, _patch_duel_score(patch, _issue_text), _multishot_count_substantive(patch)))
+        if _result3 is not None and _patch3.strip():
+            candidates.append(("third", _result3, _patch3, _patch_duel_score(_patch3, _issue_text), _multishot_count_substantive(_patch3)))
 
-        if _score2 > _score1 or (_score2 == _score1 and _n2 >= _n1):
-            _result2["multishot_attempts"] = 2
-            _result2["multishot_winner"] = "retry"
-            _result2["multishot_score_primary"] = _score1
-            _result2["multishot_score_retry"] = _score2
-            return _finalize(_maybe_emergency(_result2, _multishot_started))
+        if not candidates:
+            # All attempts empty — fall through to emergency.
+            _result1["multishot_attempts"] = 3 if _result3 is not None else 2
+            _result1["multishot_winner"] = "all_empty"
+            return _finalize(_maybe_emergency(_result1, _multishot_started))
+
+        clusters = _cluster_patches([(c[0], c[2]) for c in candidates])
+        # Sort clusters: largest first, tiebreak by max score in cluster
+        clusters.sort(key=lambda cl: (-len(cl), -max(candidates[i][3] for i in cl)))
+        winner_cluster = clusters[0]
+        # Within the largest cluster, pick by score then by line count.
+        winner_idx = max(winner_cluster, key=lambda i: (candidates[i][3], candidates[i][4]))
+        _winner_label, _winner_result, _winner_patch, _winner_score, _winner_n = candidates[winner_idx]
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        if _patch1 and _multishot_repo_obj is not None:
-            _multishot_apply_patch(_multishot_repo_obj, _patch1)
-        _result1["multishot_attempts"] = 2
-        _result1["multishot_winner"] = "primary"
-        return _finalize(_maybe_emergency(_result1, _multishot_started))
+        if _winner_patch and _multishot_repo_obj is not None:
+            _multishot_apply_patch(_multishot_repo_obj, _winner_patch)
+
+        _winner_result["multishot_attempts"] = 3 if _result3 is not None else 2
+        _winner_result["multishot_winner"] = _winner_label
+        _winner_result["multishot_cluster_size"] = len(winner_cluster)
+        _winner_result["multishot_total_candidates"] = len(candidates)
+        return _finalize(_maybe_emergency(_winner_result, _multishot_started))
 
     except Exception as exc:
         # EXCEPTION-PATH FIX: previously the exception handler returned empty
@@ -4425,15 +4620,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         Returns True when the loop should continue (a turn was queued); False
         means the caller can declare success. The order is:
             0. hail-mary — patch empty after everything: force one real edit
-            1. syntax — quote any parser error back at the model
-            2. test — actually run the companion test if one exists; if it
-                      fails, feed the failure tail back via build_test_fix_prompt
             1. polish — drop low-signal hunks the model still emitted
-            
-            
-            2. coverage-nudge — name issue-mentioned paths still untouched
-            3. criteria-nudge — name issue acceptance bullets not addressed
-            4. self-check — show the diff and ask "did you cover everything?"
+            2. syntax — quote any parser error back at the model
+            3. test — actually run the companion test if one exists; if it
+                      fails, feed the failure tail back via build_test_fix_prompt
+            4. coverage-nudge — name issue-mentioned paths still untouched
+            5. criteria-nudge — name issue acceptance bullets not addressed
+            6. self-check — show the diff and ask "did you cover everything?"
         Each refinement runs at most once per cycle. Test fires AFTER syntax
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
@@ -4480,7 +4673,27 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # === NEW ORDERING: Syntax and Test Fixes prioritized ===
+        # v20 edge — close the architectural hole at the empty-patch early
+        # exit. Hail-mary is exempt from the total-refinement cap because
+        # it's the only thing standing between us and a guaranteed-zero
+        # empty-patch result.
+        if not patch.strip():
+            if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
+                hail_mary_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_hail_mary_prompt(issue),
+                    "HAIL_MARY_QUEUED: patch empty at refinement gate",
+                )
+                return True
+            return False
+
+        # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
+        # Hard-stop if we've already used the cap (hail-mary doesn't count).
+        if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
+            return False
+
+        # Gate order: syntax → test → deletion → criteria → coverage → polish → self-check
         # Correctness gates (ground-truth or structural) consume refinement budget
         # before cosmetic gates (polish), so we don't waste a capped turn on
         # low-signal hunk cleanup when a real failure is still present.
@@ -4516,48 +4729,40 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-
-
-        # v20 edge — close the architectural hole at the empty-patch early
-        # exit. Hail-mary is exempt from the total-refinement cap because
-        # it's the only thing standing between us and a guaranteed-zero
-        # empty-patch result.
-        if not patch.strip():
-            if hail_mary_turns_used < MAX_HAIL_MARY_TURNS:
-                hail_mary_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_hail_mary_prompt(issue),
-                    "HAIL_MARY_QUEUED: patch empty at refinement gate",
-                )
-                return True
-            return False
-
-        # ninjaking66 PR#268 cap: chains of 5-7 refinements blow time budget.
-        # Hard-stop if we've already used the cap (hail-mary doesn't count).
-        if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
-            return False
-
-        # Gate order: syntax → test → deletion → criteria → coverage → polish → self-check
-        # Correctness gates (ground-truth or structural) consume refinement budget
-        # before cosmetic gates (polish), so we don't waste a capped turn on
-        # low-signal hunk cleanup when a real failure is still present.
-
-
-
-        # Deletion gap: issue says remove/delete/replace but patch has no deletions.
-        # Fires before criteria/coverage: a missing removal is a structural omission,
-        # not a coverage gap — surface it while refinement budget remains.
+        # Deletion gap: issue says remove/delete/replace but EITHER (a) the
+        # patch has no deletions at all, OR (b) named deletion targets parsed
+        # from the issue don't appear in any deletion line. Catches the
+        # "deleted something, but not the specific thing the task asked for"
+        # case (e.g. patch removes one helper but leaves the named
+        # `mcp_controller.dart` file in place).
         if deletion_nudges_used < MAX_DELETION_NUDGES:
-            if _issue_requires_deletion(issue) and not _patch_has_deletions(patch):
+            need_deletion = _issue_requires_deletion(issue)
+            no_deletions = not _patch_has_deletions(patch)
+            unsatisfied = _named_deletions_unsatisfied(patch, issue) if need_deletion else []
+            if need_deletion and (no_deletions or unsatisfied):
                 deletion_nudges_used += 1
                 total_refinement_turns_used += 1
                 must_edit_after_gap = True
                 must_edit_patch = patch
+                marker = (
+                    "DELETION_NUDGE_QUEUED: no deletion lines"
+                    if no_deletions else
+                    "DELETION_NUDGE_QUEUED: named targets unsatisfied: " + ", ".join(unsatisfied[:4])
+                )
+                # Augment the existing deletion-nudge prompt with named targets
+                # when present.
+                prompt = build_deletion_nudge_prompt(issue)
+                if unsatisfied:
+                    prompt += (
+                        "\nNamed deletion targets parsed from the task that "
+                        "are NOT yet present in your deletion lines:\n  "
+                        + "\n  ".join(f"- `{t}`" for t in unsatisfied[:8])
+                        + "\nAct on each one explicitly.\n"
+                    )
                 queue_refinement_turn(
                     assistant_text,
-                    build_deletion_nudge_prompt(issue),
-                    "DELETION_NUDGE_QUEUED: issue requires removal but patch has no deletion lines",
+                    prompt,
+                    marker,
                 )
                 return True
 
