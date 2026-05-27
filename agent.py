@@ -89,9 +89,18 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "8192"))
 
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "16000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "260000"))
-MAX_CONVERSATION_CHARS = 80000
-MAX_PRELOADED_CONTEXT_CHARS = 50000  # wider preload reduces catastrophic-floor
-MAX_PRELOADED_FILES = 22              # rounds on issues spanning multiple modules
+MAX_CONVERSATION_CHARS = 110000  # XL_NARROW_V2: raised 80k -> 110k to accommodate wider preload
+MAX_PRELOADED_CONTEXT_CHARS = 90000  # XL_NARROW_V2: depth-over-breadth (50k -> 90k)
+MAX_PRELOADED_FILES = 18              # XL_NARROW_V2: fewer files (22 -> 18) = ~5k chars each
+# XL_NARROW_V2: rank-aware per-file budget allocation. Top-3 files get
+# 8000 chars each (deep context for primary targets), middle tier gets
+# 5000, lower tier gets 3000. This concentrates context on the highest-
+# relevance files where it matters most, instead of evenly diluting
+# across all preloaded files (which masks the most relevant content).
+_RANK_AWARE_TOP_TIER = 3
+_RANK_AWARE_TOP_BUDGET = 8000
+_RANK_AWARE_MID_BUDGET = 5000
+_RANK_AWARE_LOW_BUDGET = 3000
 MAX_NO_COMMAND_REPAIRS = 2
 MAX_COMMANDS_PER_RESPONSE = 25
 
@@ -1514,7 +1523,21 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     parts: List[str] = []
     included: List[str] = []
     used = 0
-    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    # XL_NARROW_V2: rank-aware per-file budget allocation. Top-tier files
+    # (first 3 by rank) get _RANK_AWARE_TOP_BUDGET chars (8000), middle
+    # tier next 6 files get _RANK_AWARE_MID_BUDGET (5000), the rest get
+    # _RANK_AWARE_LOW_BUDGET (3000). Old logic divided MAX_PRELOADED_CONTEXT_CHARS
+    # uniformly which diluted highest-relevance content. The replacement
+    # concentrates context on the files that are most likely targets,
+    # leaving only token-budget for awareness/scan of less critical files.
+    def _xlnv2_per_file_budget(rank_idx: int) -> int:
+        if rank_idx < _RANK_AWARE_TOP_TIER:
+            return _RANK_AWARE_TOP_BUDGET
+        if rank_idx < _RANK_AWARE_TOP_TIER + 6:
+            return _RANK_AWARE_MID_BUDGET
+        return _RANK_AWARE_LOW_BUDGET
+    # Fallback budget for code paths that don't use rank index (rescue files, etc).
+    per_file_budget = _RANK_AWARE_MID_BUDGET
 
     if rescue_files:
         # Banner is small and high-leverage; surface BEFORE the snippet
@@ -1532,8 +1555,10 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(rescue_banner)
         used += len(rescue_banner)
 
-    for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget, needles=needles)
+    for rank_idx, relative_path in enumerate(files[:MAX_PRELOADED_FILES]):
+        # XL_NARROW_V2: per-file budget scales by rank position
+        budget = _xlnv2_per_file_budget(rank_idx)
+        snippet = _read_context_file(repo, relative_path, budget, needles=needles)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -6854,6 +6879,822 @@ def _drop_malformed_diff_blocks(patch: str) -> str:
     except Exception:
         return patch
 
+# Post-finalize defect linters
+# ---------------------------------------------------------------------------
+# Three deterministic patch-text transforms that run after the existing
+# structural validators (_repair_hunk_header_counts, _drop_malformed_diff_blocks,
+# stub-strip) and before the salvage tiers. Each addresses a known
+# compile-time or runtime defect class:
+#
+#   _dedupe_duplicate_function_decls: byte-identical function declarations
+#       repeated in the same JS/TS source file cause TypeScript "Duplicate
+#       function implementation" errors and prevent module compilation. This
+#       linter detects the literal-duplicate case (same signature, same body)
+#       and removes later occurrences.
+#
+#   _ensure_use_client_directive: Next.js App Router client components must
+#       begin with `'use client'` when they import React hooks. A .tsx/.jsx
+#       file using useState/useEffect/etc. without this directive fails at
+#       request time with a server-component restriction error. This linter
+#       prepends the directive when a new client component is created and
+#       the directive is missing.
+#
+#   _dedupe_duplicate_imports: a duplicated import statement triggers the
+#       TypeScript "Duplicate identifier" error and a Python redefinition
+#       warning. This linter detects byte-identical import statements within
+#       the same added-file segment and removes later occurrences.
+#
+# Invariants every linter holds:
+#   - No model calls; pure text transforms. Cost: O(patch_size).
+#   - Conservative: only acts when the defect pattern is unambiguous AND the
+#     fix is byte-deterministic. Never guesses.
+#   - Round-trip: if no defect found, returns the input string unchanged.
+#   - Catch-all `except Exception: return patch` so a parse error can never
+#     corrupt a patch that would otherwise apply.
+#   - Never empties a non-empty patch.
+
+_LINT_JS_TS_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+_LINT_PY_EXTS = (".py",)
+
+
+def _dedupe_duplicate_function_decls(patch: str) -> str:
+    """Drop later-duplicate function declarations within the same JS/TS file.
+
+    A duplicated function implementation triggers the TypeScript "Duplicate
+    function implementation" compile error and prevents the module from
+    loading. Multishot agents occasionally emit the same function body twice
+    when an earlier attempt's text leaks into a later attempt's output.
+
+    Walks per-file diff blocks; for .ts/.tsx/.js/.jsx/.mjs/.cjs files,
+    identifies added lines that open a function declaration with an explicit
+    name, brackets the body by `{`/`}` on '+' lines, and removes later
+    occurrences when (name, normalized-args, full body) all match byte-for-byte.
+    Different bodies (legitimate overloads or different implementations) are
+    preserved. Hunk header counts are repaired via the existing helper.
+
+    Returns the input patch unchanged on any parse failure.
+    """
+    if not patch.strip() or "diff --git " not in patch:
+        return patch
+    try:
+        decl_pat = re.compile(
+            r"^\+(\s*)"
+            r"(?:export\s+(?:default\s+)?)?"
+            r"(?:async\s+)?"
+            r"(?:function\s+)?"
+            r"([A-Za-z_$][\w$]*)\s*"
+            r"(?:<[^>]*>)?\s*"
+            r"\(([^)]*)\)"
+            r".*\{\s*$"
+        )
+        had_trailing = patch.endswith("\n")
+        blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+        out_blocks: List[str] = []
+        for block in blocks:
+            if not block.startswith("diff --git ") or not block.strip():
+                out_blocks.append(block)
+                continue
+            fm = re.match(r"^diff --git a/([^\s]+) b/", block)
+            if not fm or not fm.group(1).endswith(_LINT_JS_TS_EXTS):
+                out_blocks.append(block)
+                continue
+            lines = block.splitlines()
+            # Map signature -> [(start_idx, end_idx_exclusive, body)]
+            spans: Dict[Tuple[str, str], List[Tuple[int, int, str]]] = {}
+            i = 0
+            while i < len(lines):
+                m = decl_pat.match(lines[i])
+                if not m:
+                    i += 1
+                    continue
+                name, args = m.group(2), m.group(3)
+                depth = lines[i].count("{") - lines[i].count("}")
+                if depth <= 0:
+                    i += 1
+                    continue
+                end = i + 1
+                while end < len(lines):
+                    ln = lines[end]
+                    if ln.startswith("+"):
+                        depth += ln.count("{") - ln.count("}")
+                        if depth <= 0:
+                            end += 1
+                            break
+                    end += 1
+                if depth > 0:
+                    # Unbalanced — skip this candidate.
+                    i = end
+                    continue
+                body = "\n".join(lines[i:end])
+                sig = (name, re.sub(r"\s+", "", args))
+                spans.setdefault(sig, []).append((i, end, body))
+                i = end
+            drop_indices: set = set()
+            for sig, occurrences in spans.items():
+                if len(occurrences) < 2:
+                    continue
+                first_body = occurrences[0][2]
+                for start, end, body in occurrences[1:]:
+                    if body == first_body:
+                        for k in range(start, end):
+                            drop_indices.add(k)
+            if not drop_indices:
+                out_blocks.append(block)
+                continue
+            new_lines = [ln for idx, ln in enumerate(lines) if idx not in drop_indices]
+            new_block = "\n".join(new_lines)
+            if not new_block.endswith("\n") and block.endswith("\n"):
+                new_block += "\n"
+            try:
+                new_block = _repair_hunk_header_counts(new_block)
+            except Exception:
+                pass
+            out_blocks.append(new_block)
+        result = "".join(out_blocks)
+        if had_trailing and result and not result.endswith("\n"):
+            result += "\n"
+        # Safety: never return an empty patch from a non-empty input.
+        if patch.strip() and not result.strip():
+            return patch
+        return result
+    except Exception:
+        return patch
+
+
+_USE_CLIENT_DIRECTIVE_RE = re.compile(r"""^\+\s*['"]use client['"]\s*;?\s*$""")
+_REACT_HOOK_IMPORT_RE = re.compile(
+    r"^\+\s*import\b[^;]*\bfrom\s+['\"]react['\"]"
+)
+_REACT_HOOK_USAGE_RE = re.compile(
+    r"^\+.*\buse(?:State|Effect|Ref|Callback|Memo|Context|Reducer|"
+    r"LayoutEffect|ImperativeHandle|DeferredValue|Transition|Id|"
+    r"SyncExternalStore|InsertionEffect|FormStatus|FormState|"
+    r"OptimisticState|Actionable)\b"
+)
+_SERVER_ONLY_PATH_RE = re.compile(
+    r"(?:^|/)(?:server|api|middleware)(?:[./]|$)"
+    r"|^app/[^/]+/route\.[tj]sx?$"
+    r"|^pages/api/"
+    r"|/middleware\.[tj]sx?$"
+)
+
+
+def _ensure_use_client_directive(patch: str) -> str:
+    """Prepend 'use client' to new Next.js client component files that need it.
+
+    In Next.js App Router, a .tsx/.jsx file that imports or uses any React
+    hook MUST begin with `'use client';`. Missing the directive throws a
+    server-component restriction error at request time. The directive is
+    a Next.js framework contract, not stylistic.
+
+    Action only fires when ALL of these hold:
+      - File is .tsx or .jsx
+      - File is created from /dev/null (hunk header `@@ -0,0 +1,N @@`)
+      - File path is not a known server-only path (/server/, /api/, route.*,
+        middleware.*, pages/api/)
+      - Added lines either import from 'react' or use a React hook by name
+      - Added lines do NOT already begin with 'use client' / "use client"
+
+    On a match, inserts `'use client';` and a blank line as the first two
+    added lines of the file's first hunk, updating the hunk header's
+    new-side count by +2.
+    """
+    if not patch.strip() or "diff --git " not in patch:
+        return patch
+    try:
+        had_trailing = patch.endswith("\n")
+        blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+        out_blocks: List[str] = []
+        for block in blocks:
+            if not block.startswith("diff --git ") or not block.strip():
+                out_blocks.append(block)
+                continue
+            fm = re.match(r"^diff --git a/([^\s]+) b/", block)
+            if not fm:
+                out_blocks.append(block)
+                continue
+            path = fm.group(1)
+            if not (path.endswith(".tsx") or path.endswith(".jsx")):
+                out_blocks.append(block)
+                continue
+            if _SERVER_ONLY_PATH_RE.search(path):
+                out_blocks.append(block)
+                continue
+            lines = block.splitlines()
+            already = False
+            uses_hooks = False
+            for ln in lines:
+                if _USE_CLIENT_DIRECTIVE_RE.match(ln):
+                    already = True
+                    break
+                if _REACT_HOOK_IMPORT_RE.match(ln) or _REACT_HOOK_USAGE_RE.match(ln):
+                    uses_hooks = True
+            if already or not uses_hooks:
+                out_blocks.append(block)
+                continue
+            hunk_idx = None
+            for idx, ln in enumerate(lines):
+                if ln.startswith("@@ "):
+                    hunk_idx = idx
+                    break
+            if hunk_idx is None:
+                out_blocks.append(block)
+                continue
+            hm = re.match(r"^@@ -0,0 \+1,(\d+) @@", lines[hunk_idx])
+            if not hm:
+                out_blocks.append(block)
+                continue
+            old_count = int(hm.group(1))
+            new_count = old_count + 2
+            lines[hunk_idx] = f"@@ -0,0 +1,{new_count} @@"
+            lines.insert(hunk_idx + 1, "+'use client';")
+            lines.insert(hunk_idx + 2, "+")
+            new_block = "\n".join(lines)
+            if not new_block.endswith("\n") and block.endswith("\n"):
+                new_block += "\n"
+            out_blocks.append(new_block)
+        result = "".join(out_blocks)
+        if had_trailing and result and not result.endswith("\n"):
+            result += "\n"
+        if patch.strip() and not result.strip():
+            return patch
+        return result
+    except Exception:
+        return patch
+
+
+_JS_IMPORT_LINE_RE = re.compile(
+    r"^\+(\s*)"
+    r"(import\s+(?:[^'\"]*?\s+from\s+)?['\"][^'\"]+['\"]\s*;?)"
+    r"\s*$"
+)
+_PY_IMPORT_LINE_RE = re.compile(
+    r"^\+(\s*)"
+    r"((?:from\s+[\w.]+\s+import\s+[\w*,\s()]+|import\s+[\w.,\s]+))"
+    r"\s*$"
+)
+
+
+def _dedupe_duplicate_imports(patch: str) -> str:
+    """Drop later-duplicate import lines within the same file's added segment.
+
+    A duplicate import statement in TypeScript triggers the "Duplicate
+    identifier" compile error; in Python it shadows the first binding and
+    can introduce redefinition warnings or surprising precedence.
+
+    Walks per-file diff blocks. For JS/TS/Python files, normalizes import
+    lines and records the first occurrence per normalized import string.
+    Any byte-identical-normalized later occurrences on '+' lines are
+    removed. Hunk header counts are repaired via the existing helper.
+
+    Returns the input patch unchanged on any parse failure.
+    """
+    if not patch.strip() or "diff --git " not in patch:
+        return patch
+    try:
+        had_trailing = patch.endswith("\n")
+        blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+        out_blocks: List[str] = []
+        for block in blocks:
+            if not block.startswith("diff --git ") or not block.strip():
+                out_blocks.append(block)
+                continue
+            fm = re.match(r"^diff --git a/([^\s]+) b/", block)
+            if not fm:
+                out_blocks.append(block)
+                continue
+            path = fm.group(1)
+            if path.endswith(_LINT_JS_TS_EXTS):
+                pat = _JS_IMPORT_LINE_RE
+            elif path.endswith(_LINT_PY_EXTS):
+                pat = _PY_IMPORT_LINE_RE
+            else:
+                out_blocks.append(block)
+                continue
+            lines = block.splitlines()
+            seen: set = set()
+            drop_indices: set = set()
+            for idx, ln in enumerate(lines):
+                m = pat.match(ln)
+                if not m:
+                    continue
+                norm = re.sub(r"\s+", " ", m.group(2)).strip()
+                if norm in seen:
+                    drop_indices.add(idx)
+                else:
+                    seen.add(norm)
+            if not drop_indices:
+                out_blocks.append(block)
+                continue
+            new_lines = [ln for idx, ln in enumerate(lines) if idx not in drop_indices]
+            new_block = "\n".join(new_lines)
+            if not new_block.endswith("\n") and block.endswith("\n"):
+                new_block += "\n"
+            try:
+                new_block = _repair_hunk_header_counts(new_block)
+            except Exception:
+                pass
+            out_blocks.append(new_block)
+        result = "".join(out_blocks)
+        if had_trailing and result and not result.endswith("\n"):
+            result += "\n"
+        if patch.strip() and not result.strip():
+            return patch
+        return result
+    except Exception:
+        return patch
+
+
+# ---------------------------------------------------------------------------
+# Best-of salvage selector
+# ---------------------------------------------------------------------------
+# Extends the existing salvage pool from "emergency fallback when winner is
+# empty" to "best-of selector when winner is suspiciously small on a multi-
+# file issue." The cluster-vote winner is preferred in the common case, but
+# when (a) the issue explicitly names multiple files, (b) the winner has
+# fewer substantive added lines than expected for that scope, and (c) the
+# salvage pool contains an alternative with more lines AND matching/better
+# duel score, we swap to the alternative. Targets the under-produced patch
+# failure mode where the cluster-vote winner ships a near-empty diff that
+# misses most of the issue scope.
+
+# OMEGA: triggers widened further. Issue must mention >=2 file paths (was 3),
+# winner must have <200 substantive lines (was 150). Production analysis of
+# 1141 king-win rationales showed missing-file failures dominate at 25%, and
+# they happen on 2-file issues as often as 3+. Wider trigger means OMEGA's
+# best-of swap fires on more rounds; alternative quality gates (criteria
+# coverage + score >= winner - 5) keep regression risk low.
+_SMARTPICK_MIN_ISSUE_FILES = 2
+# S3 MIXED-MODERATE: moderate threshold (500) + moderate ratio (1.35).
+# Sits between S1 (300/1.3 tight) and S2 (800/1.2 loose). Engages the
+# selector on patches in the 200-500 substantive-line band where neither
+# S1 nor S2's primary mechanisms are optimized for. Pairs with the new
+# scope-creep DROP mechanism that REMOVES off-scope files from the
+# winner patch entirely (not just swap selection).
+_SMARTPICK_WINNER_SMALL_THRESHOLD = 500
+_SMARTPICK_ALTERNATIVE_LINE_RATIO = 1.35
+# S3-specific: scope-creep DROP conservatism. Drop a file from the
+# winning patch only when it (a) is not mentioned in the issue text by
+# any path token, (b) is not a clear test partner of a touched file,
+# AND (c) doesn't import or get imported by any in-scope file. Threshold:
+# drop only when the off-scope file's added-lines are <= 20% of the
+# patch's total added-lines (small drops only — avoid surgery on the
+# core patch).
+_S3_SCOPE_DROP_MAX_RATIO = 0.20
+
+
+def _count_substantive_added_lines(patch: str) -> int:
+    """Count '+' diff lines that aren't headers, blank, or pure comments."""
+    if not patch:
+        return 0
+    count = 0
+    for line in patch.splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        body = line[1:].rstrip()
+        if not body:
+            continue
+        stripped = body.lstrip()
+        if not stripped:
+            continue
+        # Skip lines that are pure comments (rough but conservative).
+        if stripped.startswith(("//", "#", "/*", "* ", "<!--", '"""', "'''")):
+            continue
+        count += 1
+    return count
+
+
+_ISSUE_FILE_PATH_RE = re.compile(
+    r"[`'\"]([A-Za-z0-9_./-]+\.[A-Za-z0-9]{1,8})[`'\"]"
+)
+_URL_TLD_SUFFIXES = (".com", ".org", ".net", ".io", ".dev", ".app", ".ai", ".co")
+
+
+def _extract_issue_file_paths(issue_text: str) -> List[str]:
+    """Pull plausible file paths out of issue text via simple backtick regex."""
+    if not issue_text:
+        return []
+    seen: set = set()
+    paths: List[str] = []
+    for match in _ISSUE_FILE_PATH_RE.finditer(issue_text):
+        candidate = match.group(1)
+        if candidate in seen:
+            continue
+        if len(candidate) > 200:
+            continue
+        if candidate.count("/") > 8:
+            continue
+        if any(candidate.lower().endswith(tld) for tld in _URL_TLD_SUFFIXES):
+            continue
+        # Filter out single-segment dotfiles (e.g. `package.json` is OK; `.env` is OK; but a bare `foo.bar` with no slash and a single tiny ext could be noise — keep if has slash OR known code ext)
+        if "/" not in candidate:
+            ext = candidate.rsplit(".", 1)[-1].lower()
+            code_exts = {"py", "js", "ts", "tsx", "jsx", "mjs", "cjs", "go", "rs", "rb", "java", "kt", "cpp", "cc", "c", "h", "hpp", "swift", "vue", "css", "scss", "html", "json", "yaml", "yml", "toml", "md", "sh", "sql"}
+            if ext not in code_exts:
+                continue
+        seen.add(candidate)
+        paths.append(candidate)
+    return paths
+
+
+
+
+def _patch_touches_files(patch: str, file_paths: List[str]) -> int:
+    """Count how many of file_paths appear as `diff --git` targets in patch.
+
+    Looks for both `a/PATH` and `b/PATH` forms to catch newly-created (where
+    only `b/PATH` appears) and modified files (both forms). Pure substring
+    match — conservative but fast.
+    """
+    if not patch or not file_paths:
+        return 0
+    seen = 0
+    for path in file_paths:
+        if not path:
+            continue
+        # Both old-side (a/) and new-side (b/) hits count
+        if f" a/{path}" in patch or f" b/{path}" in patch:
+            seen += 1
+    return seen
+
+
+def _select_better_salvage_candidate(
+    winner_patch: str,
+    winner_score: int,
+    issue_text: str,
+    salvage_pool: List[Tuple[str, str, int]],
+) -> Optional[Tuple[str, str, int]]:
+    """Best-of salvage selector — same logic as the prior dedup-extensions
+    family, with wider trigger thresholds. When the winner is small on a
+    multi-file issue, swap to a higher-quality salvage entry.
+
+    Selection: candidate must have higher (file_coverage, line_count) than
+    the winner AND duel score within 5 points (no quality regression).
+    """
+    try:
+        if not winner_patch or not salvage_pool:
+            return None
+        issue_files = _extract_issue_file_paths(issue_text)
+        if len(issue_files) < _SMARTPICK_MIN_ISSUE_FILES:
+            return None
+        winner_lines = _count_substantive_added_lines(winner_patch)
+        if winner_lines >= _SMARTPICK_WINNER_SMALL_THRESHOLD:
+            return None
+        if winner_lines < 1:
+            return None
+        winner_coverage = _patch_touches_files(winner_patch, issue_files)
+        threshold = int(winner_lines * _SMARTPICK_ALTERNATIVE_LINE_RATIO)
+        score_floor = max(0, winner_score - 5)
+        best: Optional[Tuple[str, str, int]] = None
+        best_key = (winner_coverage, winner_lines)
+        for label, patch, score in salvage_pool:
+            if not patch or patch == winner_patch:
+                continue
+            if score < score_floor:
+                continue
+            lines = _count_substantive_added_lines(patch)
+            if lines < threshold:
+                continue
+            cov = _patch_touches_files(patch, issue_files)
+            key = (cov, lines)
+            if key > best_key:
+                best = (label, patch, score)
+                best_key = key
+        return best
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# S3 MIXED-MODERATE: scope-creep DROP (strip off-scope files)
+# ---------------------------------------------------------------------------
+# Retest #5647 rationales repeatedly flagged our patches for "unrelated
+# churn" and "modifies foo.json metadata, doesn't touch the actual
+# component". King already has _detect_patch_scope_creep but uses it as
+# a HINT only (line 6045). Here we promote it to an action: if a touched
+# file is provably out-of-scope AND its contribution is small (<= 20% of
+# total added lines), drop its diff block from the patch.
+#
+# "Out-of-scope" criteria (must all be true to drop):
+#   (a) no path-token match against issue text
+#   (b) not a test partner of any in-scope touched file
+#   (c) added-lines for this file <= S3_SCOPE_DROP_MAX_RATIO × patch total
+#
+# Conservative by design — small surgical drops only. If the off-scope
+# file dominates the patch (e.g., legitimate refactor that touches many
+# files), do NOT drop. This avoids surgical errors on patches where
+# our LLM correctly inferred a broader scope than the issue's literal
+# file mentions.
+
+def _s3_file_added_lines(patch: str, target_path: str) -> int:
+    """Count substantive added lines that fall inside the diff block
+    for `target_path`. Returns 0 on parse error."""
+    if not patch or not target_path:
+        return 0
+    try:
+        in_block = False
+        count = 0
+        for line in patch.splitlines():
+            if line.startswith("diff --git "):
+                in_block = (f" a/{target_path} " in line + " " or f" b/{target_path}" in line + " "
+                            or line.endswith(f" b/{target_path}")
+                            or line.endswith(f" a/{target_path}"))
+                # robust: check via word match
+                in_block = (f" a/{target_path}" in line) or (f" b/{target_path}" in line)
+                continue
+            if not in_block:
+                continue
+            if line.startswith("+") and not line.startswith("+++"):
+                body = line[1:].strip()
+                if not body:
+                    continue
+                if body.startswith(("#", "//", "/*", "* ")):
+                    continue
+                count += 1
+        return count
+    except Exception:
+        return 0
+
+
+def _s3_detect_off_scope_files(patch: str, issue_text: str) -> List[str]:
+    """Return list of touched files that are clearly off-scope.
+    Off-scope: no path-token in issue text AND not a test partner.
+    Conservative — only flags files with unambiguous off-scope signal."""
+    if not patch or not issue_text:
+        return []
+    try:
+        touched = _patch_changed_files(patch)
+        if not touched:
+            return []
+        issue_files = _extract_issue_file_paths(issue_text)
+        issue_lower = issue_text.lower()
+        in_scope_paths: set = set()
+        for path in touched:
+            if path in issue_files:
+                in_scope_paths.add(path)
+                continue
+            # path token check: any meaningful component of path in issue text?
+            parts = [p for p in re.split(r"[/\\.\-_]", path) if len(p) >= 4]
+            if any(p.lower() in issue_lower for p in parts):
+                in_scope_paths.add(path)
+                continue
+        off_scope: List[str] = []
+        for path in touched:
+            if path in in_scope_paths:
+                continue
+            # test partner check
+            base = Path(path).stem.lower()
+            is_test_partner = False
+            for in_path in in_scope_paths:
+                in_base = Path(in_path).stem.lower()
+                if in_base and (in_base in base or base in in_base):
+                    is_test_partner = True
+                    break
+            if is_test_partner:
+                continue
+            off_scope.append(path)
+        return off_scope
+    except Exception:
+        return []
+
+
+def _s3_drop_off_scope_blocks(patch: str, off_scope_paths: List[str]) -> str:
+    """Drop diff blocks for each path in off_scope_paths. Returns the
+    original patch if all blocks would be dropped (don't empty patches)."""
+    if not patch or not off_scope_paths:
+        return patch
+    try:
+        # parse into blocks split by 'diff --git ' headers
+        lines = patch.splitlines(keepends=True)
+        blocks: List[List[str]] = []
+        current: List[str] = []
+        for line in lines:
+            if line.startswith("diff --git "):
+                if current:
+                    blocks.append(current)
+                current = [line]
+            else:
+                current.append(line)
+        if current:
+            blocks.append(current)
+        kept: List[List[str]] = []
+        for b in blocks:
+            header = b[0] if b else ""
+            drop = False
+            for path in off_scope_paths:
+                if (f" a/{path}" in header) or (f" b/{path}" in header):
+                    drop = True
+                    break
+            if not drop:
+                kept.append(b)
+        if not kept:
+            return patch  # never empty the patch
+        return "".join("".join(b) for b in kept)
+    except Exception:
+        return patch
+
+
+# ---------------------------------------------------------------------------
+# M4: empty-function-body strip (OMEGA)
+# ---------------------------------------------------------------------------
+# A common challenger failure mode is creating stub functions whose body is
+# just `pass`, `return None`, or `{}`. These create implementations that
+# satisfy a name reference but do nothing. The judge penalizes them heavily
+# because they're worse than not creating the file at all (which king's
+# existing _strip_empty_new_files_from_patch handles).
+#
+# M4 detects empty-body new functions in JS/TS/Python code and drops the
+# entire diff block for that newly-created file when ALL functions in it
+# are empty-stub. Conservative: only fires on newly-created files (not
+# modifications), and only when the file contains 1+ stub function and no
+# substantive code.
+
+_M4_PY_STUB_RE = re.compile(
+    r"^\+\s*def\s+\w+\s*\([^)]*\)\s*(?:->\s*[^:]+)?:\s*$\s*\+\s*(?:pass|return\s+None|\.\.\.)\s*$",
+    re.MULTILINE,
+)
+_M4_JS_STUB_RE = re.compile(
+    r"^\+\s*(?:function|const|let|var|export\s+(?:function|const))\s+\w+\s*[^{]*\{\s*\}\s*;?\s*$",
+    re.MULTILINE,
+)
+
+
+def _strip_pure_stub_new_files(patch: str) -> str:
+    """Drop new-file diff blocks that contain only empty function stubs.
+
+    A 'pure stub file' is one created in this patch where 100% of its
+    functions/constants have empty bodies (`pass`, `return None`, `{}`,
+    `...`). Such files satisfy import paths but contribute nothing
+    functional. The judge consistently scores them lower than not
+    creating the file at all.
+
+    Action: drop the entire diff block for the file. The patch can still
+    apply (the file just won't be created). Conservative — returns the
+    input unchanged on any parse failure.
+    """
+    if not patch.strip() or "diff --git " not in patch:
+        return patch
+    try:
+        had_trailing = patch.endswith("\n")
+        blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+        out_blocks: List[str] = []
+        any_dropped = False
+        for block in blocks:
+            if not block.startswith("diff --git ") or not block.strip():
+                out_blocks.append(block)
+                continue
+            # Only consider newly-created files
+            if "new file mode" not in block:
+                out_blocks.append(block)
+                continue
+            # Extract path
+            fm = re.match(r"^diff --git a/([^\s]+) b/", block)
+            if not fm:
+                out_blocks.append(block)
+                continue
+            path = fm.group(1)
+            # Only JS/TS/Python (where stub patterns are well-defined)
+            if not path.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")):
+                out_blocks.append(block)
+                continue
+            # Count substantive lines in the added file body
+            added_lines = []
+            for line in block.splitlines():
+                if line.startswith("+") and not line.startswith("+++"):
+                    body = line[1:]
+                    if body.strip():
+                        added_lines.append(body)
+            if not added_lines:
+                out_blocks.append(block)
+                continue
+            # Heuristic: count "real code" lines (not def/function signatures,
+            # not pass/return None, not import only, not blank)
+            real_code = 0
+            stub_indicators = 0
+            for body in added_lines:
+                stripped = body.strip()
+                if not stripped:
+                    continue
+                if stripped.startswith(("import ", "from ", "export ", "//", "#", "/*", "* ")):
+                    continue
+                if stripped in ("pass", "return None", "...", "{}", "{};"):
+                    stub_indicators += 1
+                    continue
+                if re.match(r"^(def|function|const|let|var|export)\s+\w+", stripped):
+                    continue
+                # This is real code
+                real_code += 1
+            # If no real code AND at least one stub indicator → drop the file
+            if real_code == 0 and stub_indicators >= 1:
+                any_dropped = True
+                continue
+            out_blocks.append(block)
+        if not any_dropped:
+            return patch
+        result = "".join(out_blocks)
+        if had_trailing and result and not result.endswith("\n"):
+            result += "\n"
+        # Safety: never empty a non-empty patch
+        if patch.strip() and not result.strip():
+            return patch
+        return result
+    except Exception:
+        return patch
+
+
+# ---------------------------------------------------------------------------
+# M5: self-import dedupe (OMEGA)
+# ---------------------------------------------------------------------------
+# When the model creates `src/foo.ts` and writes `import { bar } from './foo'`
+# inside it, that's a self-import — the file is referencing its own export.
+# This is always a real bug (causes circular import / "cannot find module"
+# at runtime). The judge consistently flags these as critical defects.
+#
+# M5 scans newly-created files for self-imports and removes the offending
+# import line.
+
+_SELF_IMPORT_JS_RE = re.compile(
+    r"^\+(\s*import\b[^;]*?\bfrom\s+['\"](\./?\S+?)['\"])"
+)
+_SELF_IMPORT_PY_RE = re.compile(
+    r"^\+(\s*from\s+\.?(\w+)\s+import\b)"
+)
+
+
+def _strip_self_imports(patch: str) -> str:
+    """Drop import statements where a file imports from itself.
+
+    Walks each diff block; for newly-created files only, scans added lines
+    for import statements whose target resolves to the same file being
+    created. Removes the matching lines.
+
+    Returns input unchanged on any parse failure.
+    """
+    if not patch.strip() or "diff --git " not in patch:
+        return patch
+    try:
+        had_trailing = patch.endswith("\n")
+        blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+        out_blocks: List[str] = []
+        any_modified = False
+        for block in blocks:
+            if not block.startswith("diff --git ") or not block.strip():
+                out_blocks.append(block)
+                continue
+            if "new file mode" not in block:
+                out_blocks.append(block)
+                continue
+            fm = re.match(r"^diff --git a/([^\s]+) b/", block)
+            if not fm:
+                out_blocks.append(block)
+                continue
+            full_path = fm.group(1)
+            file_stem = full_path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            # Walk lines, identify self-imports
+            lines = block.splitlines()
+            keep_mask = [True] * len(lines)
+            modified = False
+            for i, line in enumerate(lines):
+                m_js = _SELF_IMPORT_JS_RE.match(line)
+                if m_js and file_stem:
+                    import_target = m_js.group(2).rsplit("/", 1)[-1]
+                    if import_target == file_stem or import_target == "./" + file_stem:
+                        keep_mask[i] = False
+                        modified = True
+                        continue
+                m_py = _SELF_IMPORT_PY_RE.match(line)
+                if m_py and file_stem:
+                    mod_name = m_py.group(2)
+                    if mod_name == file_stem:
+                        keep_mask[i] = False
+                        modified = True
+            if not modified:
+                out_blocks.append(block)
+                continue
+            new_lines = [ln for i, ln in enumerate(lines) if keep_mask[i]]
+            new_block = "\n".join(new_lines)
+            if not new_block.endswith("\n") and block.endswith("\n"):
+                new_block += "\n"
+            try:
+                new_block = _repair_hunk_header_counts(new_block)
+            except Exception:
+                pass
+            any_modified = True
+            out_blocks.append(new_block)
+        if not any_modified:
+            return patch
+        result = "".join(out_blocks)
+        if had_trailing and result and not result.endswith("\n"):
+            result += "\n"
+        if patch.strip() and not result.strip():
+            return patch
+        return result
+    except Exception:
+        return patch
+
+
+
+
 
 def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
     if not patch_text.strip():
@@ -6953,6 +7794,74 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                         if _stripped != result["patch"]:
                             result["patch"] = _stripped
                             result["empty_stub_files_stripped"] = _empty_paths
+                # Post-finalize defect linters (additive, no model calls)
+                try:
+                    _m1 = _dedupe_duplicate_function_decls(result["patch"])
+                    if _m1 != result["patch"] and _m1.strip():
+                        result["patch"] = _m1
+                        result["dedup_fn_decls_applied"] = True
+                except Exception:
+                    pass
+                try:
+                    _m2 = _ensure_use_client_directive(result["patch"])
+                    if _m2 != result["patch"] and _m2.strip():
+                        result["patch"] = _m2
+                        result["use_client_prepended"] = True
+                except Exception:
+                    pass
+                try:
+                    _m3 = _dedupe_duplicate_imports(result["patch"])
+                    if _m3 != result["patch"] and _m3.strip():
+                        result["patch"] = _m3
+                        result["dedup_imports_applied"] = True
+                except Exception:
+                    pass
+                try:
+                    _m4 = _strip_pure_stub_new_files(result["patch"])
+                    if _m4 != result["patch"] and _m4.strip():
+                        result["patch"] = _m4
+                        result["empty_stub_files_dropped"] = True
+                except Exception:
+                    pass
+                try:
+                    _m5 = _strip_self_imports(result["patch"])
+                    if _m5 != result["patch"] and _m5.strip():
+                        result["patch"] = _m5
+                        result["self_imports_dropped"] = True
+                except Exception:
+                    pass
+                # Best-of salvage selector: under-produced winner on multi-
+                # file issue → swap to higher-coverage salvage candidate.
+                try:
+                    _winner_score = _patch_duel_score(result["patch"], _issue_text)
+                    _better = _select_better_salvage_candidate(
+                        result["patch"], _winner_score, _issue_text, _salvage_pool,
+                    )
+                    if _better is not None:
+                        result["patch"] = _better[1]
+                        result["smartpick_swapped_to"] = _better[0]
+                except Exception:
+                    pass
+                # S3 MIXED-MODERATE: scope-creep DROP. Strip off-scope
+                # files from the winning patch if they contribute <= 20%
+                # of total added-lines (small surgical drops only).
+                try:
+                    _off_scope = _s3_detect_off_scope_files(result["patch"], _issue_text)
+                    if _off_scope:
+                        _total_added = _count_substantive_added_lines(result["patch"])
+                        if _total_added > 0:
+                            _off_added = sum(
+                                _s3_file_added_lines(result["patch"], p) for p in _off_scope
+                            )
+                            if _off_added > 0 and (_off_added / _total_added) <= _S3_SCOPE_DROP_MAX_RATIO:
+                                _stripped_off = _s3_drop_off_scope_blocks(
+                                    result["patch"], _off_scope
+                                )
+                                if _stripped_off and _stripped_off != result["patch"]:
+                                    result["patch"] = _stripped_off
+                                    result["s3_off_scope_dropped"] = _off_scope[:6]
+                except Exception:
+                    pass
             # Two-tier salvage: never ship `success=False AND empty patch`
             # (the solver_error 0-score case). If every transformation
             # above emptied the patch — or every attempt produced nothing
