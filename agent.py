@@ -101,6 +101,8 @@ _RANK_AWARE_TOP_TIER = 3
 _RANK_AWARE_TOP_BUDGET = 8000
 _RANK_AWARE_MID_BUDGET = 5000
 _RANK_AWARE_LOW_BUDGET = 3000
+_ISSUE_CASE_BLOCK_BUDGET = 5000        # cap on the 'Issue-case' preload block (fenced code + tracebacks)
+_ACCEPTANCE_CHECKPOINTS_BUDGET = 2000  # cap on the numbered 'Acceptance checkpoints' preload block
 MAX_NO_COMMAND_REPAIRS = 2
 MAX_COMMANDS_PER_RESPONSE = 25
 
@@ -1423,6 +1425,8 @@ def _project_hint_block(repo: Path, max_chars: int = 2600) -> str:
     )
 
 
+# === v71 GRAFT FROM v54: needle-aware preload (v54 lines 1516-1605) ===
+
 def _preload_needles(issue: str) -> List[str]:
     out: List[str] = []
     seen: set = set()
@@ -1516,6 +1520,100 @@ def _extract_relevant_regions(
 
 
 # === v71 GRAFT END ===
+
+
+_FENCED_CODE_RE = re.compile(r"```[ \t]*([\w.+#-]*)[ \t]*\r?\n(.*?)```", re.DOTALL)
+_TRACEBACK_RE = re.compile(
+    r"Traceback \(most recent call last\):\r?\n"
+    r"(?:.*\r?\n)*?"
+    r"[A-Za-z_][\w.]*(?:Error|Exception|Warning|Interrupt|Exit)(?::[^\n]*)?",
+)
+
+
+def _extract_issue_case_block(issue_text: str, budget: int = _ISSUE_CASE_BLOCK_BUDGET) -> str:
+    """Surface concrete reproduction material from the issue body.
+
+    Pulls fenced code blocks and standalone Python tracebacks out of the issue
+    and renders them under an 'Issue-case' header, so the model treats them as
+    the canonical reproduction / expected-behavior case rather than prose to be
+    skimmed. Tracebacks already inside a fenced block are not emitted twice.
+    Returns "" when the issue carries no such material.
+    """
+    if not issue_text:
+        return ""
+    rendered: List[Tuple[str, str]] = []
+    seen: set = set()
+
+    def _add(label: str, body: str) -> None:
+        body = body.strip("\r\n")
+        key = body.strip()
+        if not key or key in seen:
+            return
+        seen.add(key)
+        rendered.append((label, body))
+
+    fenced_spans: List[Tuple[int, int]] = []
+    for m in _FENCED_CODE_RE.finditer(issue_text):
+        fenced_spans.append(m.span())
+        lang = (m.group(1) or "").strip()
+        _add(f"code:{lang}" if lang else "code", m.group(2))
+
+    for m in _TRACEBACK_RE.finditer(issue_text):
+        if any(s <= m.start() < e for s, e in fenced_spans):
+            continue
+        _add("traceback", m.group(0))
+
+    if not rendered:
+        return ""
+
+    header = "### Issue-case (reproduction / expected-behavior excerpts pulled from the issue)"
+    lines = [header]
+    used = len(header)
+    for label, body in rendered:
+        block = f"#### {label}\n```\n{_truncate(body, 1600)}\n```"
+        if used + len(block) > budget:
+            break
+        lines.append(block)
+        used += len(block)
+    if len(lines) == 1:
+        return ""
+    return "\n\n".join(lines)
+
+
+def _build_acceptance_checkpoints_block(
+    issue_text: str, budget: int = _ACCEPTANCE_CHECKPOINTS_BUDGET
+) -> str:
+    """Compact numbered 'Acceptance checkpoints' block for the preload context.
+
+    Surfaces the same acceptance criteria the downstream coverage gates use
+    (_extract_acceptance_criteria) plus any explicit file-scope mentions
+    (_extract_issue_path_mentions), so the model sees the success contract and
+    the in-scope files before it starts editing. Returns "" when neither helper
+    yields anything.
+    """
+    if not issue_text:
+        return ""
+    criteria = _extract_acceptance_criteria(issue_text)
+    mentions = _extract_issue_path_mentions(issue_text)
+    if not criteria and not mentions:
+        return ""
+
+    header = "### Acceptance checkpoints (verify each before <final>)"
+    lines = [header]
+    used = len(header)
+    for i, c in enumerate(criteria[:_CRITERIA_MAX_BULLETS]):
+        entry = f"  {i + 1}. {c}"
+        if used + len(entry) > budget:
+            break
+        lines.append(entry)
+        used += len(entry)
+    if mentions:
+        scope = "  file-scope: " + ", ".join(mentions[:12])
+        if used + len(scope) <= budget:
+            lines.append(scope)
+    if len(lines) == 1:
+        return ""
+    return "\n".join(lines)
 
 
 def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
@@ -1628,28 +1726,6 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
 
-    _issue_examples = _extract_issue_examples(issue)
-    if _issue_examples:
-        _examples_block = _format_issue_examples(_issue_examples)
-        if _examples_block and used + len(_examples_block) <= MAX_PRELOADED_CONTEXT_CHARS + _EXAMPLES_BLOCK_BUDGET:
-            parts.append(_examples_block)
-            used += len(_examples_block)
-
-    try:
-        _checkpoint_criteria = _extract_acceptance_criteria(issue)
-        _checkpoint_paths = _extract_issue_file_paths(issue)
-        _checkpoint_path_mentions = _extract_issue_path_mentions(issue)
-    except Exception:
-        _checkpoint_criteria = []
-        _checkpoint_paths = []
-        _checkpoint_path_mentions = []
-    _checkpoints_block = _format_acceptance_checkpoints(
-        _checkpoint_criteria, _checkpoint_paths, _checkpoint_path_mentions
-    )
-    if _checkpoints_block and used + len(_checkpoints_block) <= MAX_PRELOADED_CONTEXT_CHARS + _CHECKPOINTS_BLOCK_BUDGET:
-        parts.append(_checkpoints_block)
-        used += len(_checkpoints_block)
-
     likely_tests = _discover_likely_test_nodes(repo, issue, tracked_set)
     if likely_tests:
         test_lines = [
@@ -1660,6 +1736,19 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         test_block = "\n\n".join(test_lines)
         if used + len(test_block) <= MAX_PRELOADED_CONTEXT_CHARS + 2500:
             parts.append(test_block)
+
+    # Concrete reproduction material (fenced code + tracebacks) and the
+    # numbered acceptance-checkpoint contract, conditionally appended so the
+    # model reads them alongside the preloaded snippets.
+    issue_case = _extract_issue_case_block(issue)
+    if issue_case and used + len(issue_case) <= MAX_PRELOADED_CONTEXT_CHARS + _ISSUE_CASE_BLOCK_BUDGET:
+        parts.append(issue_case)
+        used += len(issue_case)
+
+    acceptance_checkpoints = _build_acceptance_checkpoints_block(issue)
+    if acceptance_checkpoints and used + len(acceptance_checkpoints) <= MAX_PRELOADED_CONTEXT_CHARS + _ACCEPTANCE_CHECKPOINTS_BUDGET:
+        parts.append(acceptance_checkpoints)
+        used += len(acceptance_checkpoints)
 
     return "\n\n".join(parts), included
 
@@ -2001,151 +2090,6 @@ def _context_file_allowed(relative_path: str) -> bool:
     if path.name not in TEXT_FILE_BASENAMES and path.suffix.lower() not in TEXT_FILE_EXTENSIONS:
         return False
     return True
-
-
-# Issue-provided concrete examples (fenced code blocks + tracebacks from
-# the issue body). The bug reporter's own snippets are the highest-fidelity
-# ground truth available; lifting them into a labeled preload block lets
-# the solver anchor against the artifacts the reporter described.
-
-_FENCED_CODE_BLOCK_RE = re.compile(
-    r"```(?P<lang>[A-Za-z0-9_+.-]*)\s*\n(?P<body>.*?)(?:\n)?```",
-    re.DOTALL,
-)
-_TRACEBACK_RE = re.compile(
-    r"(Traceback\s*\(most recent call last\):.*?(?:Error|Exception|Warning):[^\n]*"
-    r"(?:\n\s+(?:File\s+|raise\s+|\w+Error|\w+Exception)[^\n]*)*)",
-    re.DOTALL,
-)
-_EXAMPLES_BLOCK_BUDGET = 4000
-_EXAMPLES_PER_BLOCK_CAP = 1200
-_EXAMPLES_MAX_ITEMS = 5
-
-
-def _extract_issue_examples(issue_text: str) -> List[Dict[str, str]]:
-    """Pull author-supplied concrete examples from the issue body.
-
-    Returns a list of {kind, lang, body} dicts in original order.
-    Skips fences shorter than 12 chars (usually inline tokens). De-dups
-    byte-identical bodies.
-    """
-    if not issue_text:
-        return []
-    if "```" not in issue_text and "Traceback" not in issue_text:
-        return []
-    examples: List[Dict[str, str]] = []
-    seen: set = set()
-    try:
-        for match in _FENCED_CODE_BLOCK_RE.finditer(issue_text):
-            body = (match.group("body") or "").strip()
-            if len(body) < 12:
-                continue
-            sig = body[:200]
-            if sig in seen:
-                continue
-            seen.add(sig)
-            lang = (match.group("lang") or "").strip().lower()
-            examples.append({"kind": "code", "lang": lang, "body": body})
-            if len(examples) >= _EXAMPLES_MAX_ITEMS:
-                break
-        for match in _TRACEBACK_RE.finditer(issue_text):
-            body = match.group(1).strip()
-            if len(body) < 24:
-                continue
-            sig = body[:200]
-            if sig in seen:
-                continue
-            seen.add(sig)
-            examples.append({"kind": "traceback", "lang": "", "body": body})
-            if len(examples) >= _EXAMPLES_MAX_ITEMS:
-                break
-    except Exception:
-        return []
-    return examples
-
-
-def _format_issue_examples(examples: List[Dict[str, str]]) -> str:
-    """Render extracted examples as a labeled preloaded-context block."""
-    if not examples:
-        return ""
-    lines: List[str] = [
-        "### Author-provided examples from the issue (ground truth — use these to verify your fix)"
-    ]
-    used = len(lines[0])
-    for ex in examples:
-        body = ex["body"]
-        if len(body) > _EXAMPLES_PER_BLOCK_CAP:
-            body = body[:_EXAMPLES_PER_BLOCK_CAP].rstrip() + "\n... [truncated]"
-        if ex["kind"] == "traceback":
-            block = f"#### Error trace from the issue\n```\n{body}\n```"
-        else:
-            fence_lang = ex["lang"] or ""
-            block = f"#### Example code from the issue\n```{fence_lang}\n{body}\n```"
-        if used + len(block) + 2 > _EXAMPLES_BLOCK_BUDGET:
-            break
-        lines.append(block)
-        used += len(block) + 2
-    if len(lines) == 1:
-        return ""
-    return "\n\n".join(lines)
-
-
-# Acceptance-checkpoint structuring. Existing acceptance-criteria and
-# file-path extractors are used downstream during refinement; surfacing the
-# same structured information as a numbered checklist at the top of the
-# preloaded context lets attempt 1 plan against explicit requirements from
-# the start, rather than waiting for a refinement nudge after attempt-1 has
-# already missed a file or criterion.
-
-_CHECKPOINTS_BLOCK_BUDGET = 1800
-_CHECKPOINTS_MAX_CRITERIA = 8
-_CHECKPOINTS_MAX_PATHS = 8
-_CHECKPOINT_LINE_CAP = 220
-
-
-def _format_acceptance_checkpoints(
-    criteria: List[str], paths: List[str], path_mentions: List[str]
-) -> str:
-    """Render acceptance criteria + file-scope as a numbered checklist."""
-    if not criteria and not paths and not path_mentions:
-        return ""
-    seen_paths: set = set()
-    merged_paths: List[str] = []
-    for source in (paths, path_mentions):
-        for p in source:
-            key = p.strip("`'\"()[]{}:,;").strip()
-            if not key or key in seen_paths:
-                continue
-            seen_paths.add(key)
-            merged_paths.append(key)
-            if len(merged_paths) >= _CHECKPOINTS_MAX_PATHS:
-                break
-        if len(merged_paths) >= _CHECKPOINTS_MAX_PATHS:
-            break
-    parts: List[str] = ["### Acceptance checkpoints extracted from the issue"]
-    used = len(parts[0])
-    if criteria:
-        crit_lines = ["", "**Criteria the patch should address:**"]
-        for idx, c in enumerate(criteria[:_CHECKPOINTS_MAX_CRITERIA], start=1):
-            line = c.strip()
-            if len(line) > _CHECKPOINT_LINE_CAP:
-                line = line[:_CHECKPOINT_LINE_CAP].rstrip() + "..."
-            crit_lines.append(f"  {idx}. {line}")
-        crit_block = "\n".join(crit_lines)
-        if used + len(crit_block) <= _CHECKPOINTS_BLOCK_BUDGET:
-            parts.append(crit_block)
-            used += len(crit_block)
-    if merged_paths:
-        path_lines = ["", "**File-scope mentioned in the issue (ensure each is touched or has a clear reason not to be):**"]
-        for p in merged_paths:
-            path_lines.append(f"  - `{p}`")
-        path_block = "\n".join(path_lines)
-        if used + len(path_block) <= _CHECKPOINTS_BLOCK_BUDGET:
-            parts.append(path_block)
-            used += len(path_block)
-    if len(parts) == 1:
-        return ""
-    return "\n".join(parts)
 
 
 def _extract_issue_path_mentions(issue: str) -> List[str]:
@@ -6664,6 +6608,8 @@ Error messages are often tested exactly. When changing one, match capitalization
 
 **Existing-symbol fidelity.** The same rule applies to code-level identifiers the existing repo or issue already names: function and method names, field/column names, constant names, file paths, and library API surfaces. When the issue mentions `get_users()`, do not invent `fetch_users()` or `getUserList()`. When an existing model has a `base_start` field, do not introduce `startBase`. When an API exposes `setDoc(ref, data)`, do not call `addDoc(ref, data)`. Grep the surrounding code or the imports to confirm the exact name before adding a call — invented synonyms are runtime errors, not stylistic preferences.
 
+**No field-name aliasing.** Reuse a field's canonical name end to end — never expose, map, or serialize an existing field under a second name. No serializer `source=`/`alias=` rename, no `{camelName: obj.snake_name}` remap in a selector or response builder, no getter/property that merely re-points to an existing field. The consumer (UI, test, API client) reads the canonical key; an alias delivers the value under the wrong key and leaves the expected key missing. If the issue explicitly asks to RENAME a field, change it everywhere and remove the old name — do not add the alias alongside it.
+
 **Preserve conditional logic during refactors.** When simplifying or refactoring existing code, do NOT collapse a conditional branch (`a ? x : y`, `if a: x else: y`, `match x: case A => ... case B => ...`) into a single literal. The conditional exists because two cases produce different values. Hardcoding one breaks the other. Concrete example: turning `color: isMine ? '#fff' : '#1e293b'` into `color: '#fff'` makes received messages invisible on white backgrounds. If you don't understand why a conditional is there, keep it as-is — investigate before deleting branches.
 
 Preserve public API and backwards compatibility unless the issue explicitly requires a breaking change: function/method names, signatures, exported types, CLI flags, config keys, response shapes, error classes, schemas, file formats, env-var names.
@@ -7048,6 +6994,137 @@ def build_self_check_prompt(
         "Otherwise emit corrective `<edit>` and/or `<command>` blocks in the SAME response "
         "(run missing tests, fix root causes, revert scope-creep hunks), "
         "then end with <final>summary</final>. Do NOT add new features, destructive operations, or unrelated scope."
+    )
+
+
+def build_final_review_prompt(
+    patch: str,
+    issue_text: str,
+    junk_summary: str = "",
+    inplace_advisories: Optional[List[str]] = None,
+) -> str:
+    """Merged final-review prompt (v4): low-signal-hunk cleanup (the old polish
+    gate) + the correctness/completeness/scope self-check, in one turn. The
+    cleanup section is included only when low-signal hunks are present; the
+    self-check body is reused verbatim from build_self_check_prompt."""
+    cleanup = ""
+    if junk_summary:
+        cleanup = (
+            "CLEANUP — your draft contains low-signal hunks that hurt diff "
+            f"quality:\n  {junk_summary}\n"
+            "Revert ONLY those (mode-only changes, comment/docstring-only "
+            "rewordings, whitespace/blank-line-only edits, accent normalisation, "
+            "drive-by import reorders/renames, vendor/lockfile/minified diffs). "
+            "Keep substantive code changes.\n\n"
+        )
+    return cleanup + build_self_check_prompt(
+        patch, issue_text, inplace_advisories=inplace_advisories
+    )
+
+
+def build_completeness_prompt(
+    issue_text: str,
+    *,
+    deletion: "Optional[Tuple[bool, List[str]]]" = None,
+    destructive: Optional[List[str]] = None,
+    criteria: Optional[List[str]] = None,
+    coverage: Optional[List[str]] = None,
+    relocation_gap: bool = False,
+    removed_names: Optional[List[str]] = None,
+    final_requirements: Optional[List[str]] = None,
+) -> str:
+    """Single combined 'completeness' refinement prompt (v4).
+
+    Merges the five old issue-vs-patch gap nudges (deletion, unsolicited
+    destructive deletion, unaddressed criteria, uncovered/relocation coverage,
+    and the pre-final per-requirement checklist) into ONE turn. Each gap
+    category that actually fired contributes one labeled section; they share a
+    single task reference and a single closing instruction. Returns '' when no
+    category fired, so the caller can skip the gate. Replaces up to five
+    separate refinement turns — each competing for the 3-turn budget — with one.
+    """
+    sections: List[str] = []
+
+    if deletion is not None:
+        no_deletions, unsatisfied = deletion
+        body = [
+            "DELETION GAP — the task requires removing/deleting/replacing "
+            "existing code, but "
+            + ("your patch contains NO deletion lines."
+               if no_deletions else
+               "named deletion target(s) are still present.")
+        ]
+        if unsatisfied:
+            body.append(
+                "  Named targets not yet deleted:\n    "
+                + "\n    ".join(f"- `{t}`" for t in unsatisfied[:8])
+            )
+        body.append(
+            "  Issue the necessary removals (delete statements/files, revert old "
+            "implementations that should be replaced not just augmented)."
+        )
+        sections.append("\n".join(body))
+
+    if destructive:
+        sections.append(
+            "UNSOLICITED DELETION — the task uses only additive verbs, but your "
+            "patch deletes large blocks:\n    "
+            + "\n    ".join(destructive[:5])
+            + "\n  Restore the removed lines unless the deletion is strictly "
+            "required by the task."
+        )
+
+    if criteria:
+        sections.append(
+            "UNADDRESSED CRITERIA — these acceptance checkpoints are NOT reflected "
+            "in your added lines:\n    "
+            + "\n    ".join(f"- {c}" for c in criteria[:8])
+            + "\n  For EACH, add the criterion's concrete vocabulary (identifier, "
+            "string literal, route, field) to the right file."
+        )
+
+    if coverage or relocation_gap:
+        cov = ["COVERAGE GAP —"]
+        if coverage:
+            cov.append(
+                "  the task names these path(s) your patch does NOT touch:\n    "
+                + "\n    ".join(f"- {p}" for p in coverage[:8])
+                + "\n  Open each and make the edits the task requires."
+            )
+        if relocation_gap:
+            cov.append(
+                "  RELOCATION: the task implies a file at a NEW path but your patch "
+                "has no `new file mode` header — create the new file and update "
+                "every importer/caller, rather than editing in place."
+            )
+        if removed_names:
+            cov.append(
+                "  AUDIT removed/renamed names (update all callers): "
+                + ", ".join(removed_names[:8])
+            )
+        sections.append("\n".join(cov))
+
+    if final_requirements and len(final_requirements) >= 2:
+        bullets = "\n    ".join(
+            f"R{i + 1}. {r}" for i, r in enumerate(final_requirements[:10])
+        )
+        sections.append(
+            "PRE-FINAL CHECKLIST — before shipping, for EACH requirement emit one "
+            "line `R<n>: [DONE] evidence (file/line)` or `R<n>: [TODO] what's "
+            "missing`, then fix every [TODO]:\n    " + bullets
+        )
+
+    if not sections:
+        return ""
+
+    return (
+        "Completeness review — your draft has gap(s) against the task. Address "
+        "EVERY numbered section below in THIS turn with the smallest edits that "
+        "close each gap; do NOT add unrelated scope or rewrite working code. "
+        "When all are handled, end with <final>summary</final>.\n\n"
+        + "\n\n".join(f"{i + 1}) {s}" for i, s in enumerate(sections))
+        + "\n\nTask (for reference):\n"
+        + issue_text[:1800]
     )
 
 
@@ -9363,14 +9440,8 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                         except Exception:
                             pass
 
-        # Within the largest cluster, pick by score; tie-break to the
-        # SHORTER patch. When two attempts have equivalent coverage and
-        # criteria scores, the tighter patch usually aligns better with
-        # the minimal-change shape a reviewer expects.
-        winner_idx = max(
-            winner_cluster,
-            key=lambda i: (candidates[i][3], -len(candidates[i][2])),
-        )
+        # Within the largest cluster, pick by score then by line count.
+        winner_idx = max(winner_cluster, key=lambda i: (candidates[i][3], candidates[i][4]))
 
         _winner_label, _winner_result, _winner_patch, _winner_score, _winner_n = candidates[winner_idx]
         # Telemetry: flag low-confidence ship for downstream debugging
@@ -9436,14 +9507,16 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     total_cost: Optional[float] = 0.0
     success = False
     consecutive_no_command = 0
-    polish_turns_used = 0
-    self_check_turns_used = 0
+    # Merged refinement gates (v4): syntax · test-correctness · completeness ·
+    # final-review. Each fires at most once; the old per-nudge counters
+    # (polish/self_check/baseline_verify/coverage/criteria/final_checklist/
+    # deletion/destructive) were folded into completeness_turns_used and
+    # final_review_turns_used to stop near-duplicate gates competing for the
+    # MAX_TOTAL_REFINEMENT_TURNS budget.
     syntax_fix_turns_used = 0
     test_fix_turns_used = 0
-    baseline_verify_used = 0
-    coverage_nudges_used = 0
-    criteria_nudges_used = 0
-    final_checklist_used = 0
+    completeness_turns_used = 0
+    final_review_turns_used = 0
     hail_mary_turns_used = 0
     mid_loop_hail_mary_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
@@ -9451,8 +9524,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     must_edit_after_gap = False
     must_edit_patch = ""
     gap_edit_nudges_used = 0
-    deletion_nudges_used = 0
-    destructive_deletion_nudges_used = 0
     ship_blocker_nudges_used = 0
     verification_nudges_used = 0
     last_verification_step = 0
@@ -9505,20 +9576,25 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         """If the current patch warrants a refinement turn, queue it.
 
         Returns True when the loop should continue (a turn was queued); False
-        means the caller can declare success. The order is:
-            0. hail-mary — patch empty after everything: force one real edit
-            1. polish — drop low-signal hunks the model still emitted
-            2. syntax — quote any parser error back at the model
-            3. test — actually run the companion test if one exists; if it
-                      fails, feed the failure tail back via build_test_fix_prompt
-            4. coverage-nudge — name issue-mentioned paths still untouched
-            5. criteria-nudge — name issue acceptance bullets not addressed
-            6. self-check — show the diff and ask "did you cover everything?"
-        Each refinement runs at most once per cycle. Test fires AFTER syntax
-        (we know the patch parses) but BEFORE coverage/criteria/self-check
-        (those are heuristic; test is ground truth from a real runner).
+        means the caller can declare success.
+
+        v4 merged the old ten gates into FOUR, in correctness→cosmetic order, so
+        the MAX_TOTAL_REFINEMENT_TURNS budget covers the whole concern-space
+        instead of being spent on near-duplicate prompts:
+            0. hail-mary — patch empty: force one real edit (exempt from cap)
+            1. syntax — quote any parser error back at the model
+            2. test-correctness — run the most authoritative test (baseline
+               failing tests, else the companion test); feed the failure tail
+            3. completeness — ONE prompt enumerating every issue-vs-patch gap
+               (missing/named deletions, unsolicited destructive deletions,
+               unaddressed criteria, uncovered/relocation coverage, and the
+               pre-final per-requirement checklist)
+            4. final-review — low-signal-hunk cleanup + the correctness/
+               completeness/scope self-check, in one prompt
+        Each gate fires at most once. Correctness gates (ground-truth or
+        structural) run before the cosmetic final-review.
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, baseline_verify_used, coverage_nudges_used, criteria_nudges_used, final_checklist_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used, deletion_nudges_used, destructive_deletion_nudges_used
+        nonlocal syntax_fix_turns_used, test_fix_turns_used, completeness_turns_used, final_review_turns_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used
         patch = get_patch(repo)
 
         # === NEW (P1 #3): Adaptive refinement gating =========================
@@ -9580,11 +9656,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if total_refinement_turns_used >= MAX_TOTAL_REFINEMENT_TURNS:
             return False
 
-        # Gate order: syntax → test → deletion → criteria → coverage → polish → self-check
+        # Merged gate order: syntax → test-correctness → completeness → final-review.
         # Correctness gates (ground-truth or structural) consume refinement budget
-        # before cosmetic gates (polish), so we don't waste a capped turn on
-        # low-signal hunk cleanup when a real failure is still present.
+        # before the cosmetic final-review, so a real failure is never displaced
+        # by low-signal hunk cleanup.
 
+        # --- Gate 1: syntax -------------------------------------------------
         if syntax_fix_turns_used < MAX_SYNTAX_FIX_TURNS:
             syntax_errors = _check_syntax(repo, patch)
             if syntax_errors:
@@ -9597,227 +9674,133 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return True
 
-        # Baseline-verify gate: re-run the originally-failing tests we surfaced
-        # in the initial prompt. If any still fails, the patch hasn't fixed the
-        # bug the issue actually describes — feed the new failure tail back so
-        # the model can target it directly. Runs at most once per attempt and
-        # only when the pre-solve probe found failing tests to begin with.
-        if (
-            baseline_verify_used < MAX_BASELINE_VERIFY_TURNS
-            and _baseline_failing_tests
-        ):
-            still = _verify_baseline_tests_pass(
-                repo,
-                _baseline_failing_tests,
-                timeout_seconds=_companion_test_timeout_seconds(
-                    command_timeout, time_remaining()
-                ),
-            )
-            # Mark the gate as used regardless of outcome — running the probe
-            # already consumed budget, and if tests passed we don't want to
-            # re-run them on the next refinement check. Only consume the
-            # cross-gate refinement turn when we actually queue a fix turn.
-            baseline_verify_used += 1
-            if still is not None:
-                # Re-check the time floor: the probe just spent up to ~18-24s
-                # of wall-clock that the floor check above couldn't account
-                # for. Without the recheck we can queue a refinement turn
-                # that the loop can't finish before WALL_CLOCK_STOP fires,
-                # shipping a half-formed patch.
+        # --- Gate 2: test-correctness (merge of baseline-verify + companion) -
+        # Run the single most authoritative test once: prefer the originally
+        # failing tests surfaced at prompt time (ground truth for the bug),
+        # else the companion test. Feed the first still-failing tail back via
+        # build_test_fix_prompt. The gate is marked used after running a probe
+        # (regardless of outcome) so we never re-run expensive tests on a later
+        # refinement check.
+        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
+            test_failure: Optional[Tuple[str, str]] = None
+            probed = False
+            if _baseline_failing_tests:
+                probed = True
+                test_failure = _verify_baseline_tests_pass(
+                    repo,
+                    _baseline_failing_tests,
+                    timeout_seconds=_companion_test_timeout_seconds(
+                        command_timeout, time_remaining()
+                    ),
+                )
+            if test_failure is None:
+                probed = True
+                test_failure = _select_companion_test_failure(
+                    repo,
+                    patch,
+                    test_timeout_seconds=_companion_test_timeout_seconds(
+                        command_timeout, time_remaining()
+                    ),
+                    failed_node_ids=last_failed_test_names,
+                )
+            if probed:
+                # Mark used regardless of outcome — the probe already spent
+                # budget; don't re-run it on the next refinement check.
+                test_fix_turns_used += 1
+            if test_failure is not None:
+                # The probe just spent up to ~18-24s of wall-clock the floor
+                # check above couldn't account for; recheck before queuing.
                 if time_remaining() < _REFINEMENT_TIME_FLOOR_SECONDS:
                     logs.append(
-                        "REFINEMENT_TIME_GATED_POST_BASELINE_VERIFY:\n  "
+                        "REFINEMENT_TIME_GATED_POST_TEST:\n  "
                         f"remaining={time_remaining():.1f}s "
                         f"floor={_REFINEMENT_TIME_FLOOR_SECONDS:.1f}s"
                     )
                     return False
-                node_id, new_failure = still
+                node_id, new_failure = test_failure
                 total_refinement_turns_used += 1
                 queue_refinement_turn(
                     assistant_text,
                     build_test_fix_prompt(node_id, new_failure),
-                    f"BASELINE_VERIFY_FAILED:\n  {node_id}",
+                    f"TEST_FIX_QUEUED:\n  {node_id}",
                 )
                 return True
 
-        if test_fix_turns_used < MAX_TEST_FIX_TURNS:
-            failure = _select_companion_test_failure(
-                repo,
-                patch,
-                test_timeout_seconds=_companion_test_timeout_seconds(
-                    command_timeout, time_remaining()
-                ),
-                failed_node_ids=last_failed_test_names,
-            )
-            if failure is not None:
-                test_path, output = failure
-                test_fix_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_test_fix_prompt(test_path, output),
-                    f"TEST_FIX_QUEUED:\n  {test_path}",
-                )
-                return True
-
-        # Deletion gap: issue says remove/delete/replace but EITHER (a) the
-        # patch has no deletions at all, OR (b) named deletion targets parsed
-        # from the issue don't appear in any deletion line. Catches the
-        # "deleted something, but not the specific thing the task asked for"
-        # case (e.g. patch removes one helper but leaves the named
-        # `mcp_controller.dart` file in place).
-        if deletion_nudges_used < MAX_DELETION_NUDGES:
+        # --- Gate 3: completeness (merge of deletion + destructive + criteria +
+        #     coverage/relocation + pre-final checklist) ----------------------
+        # Compute every issue-vs-patch gap, then emit ONE prompt naming all of
+        # them, rather than burning up to five separate turns. Fires once when
+        # any category triggers.
+        if completeness_turns_used < 1:
             need_deletion = _issue_requires_deletion(issue)
             no_deletions = not _patch_has_deletions(patch)
             unsatisfied = _named_deletions_unsatisfied(patch, issue) if need_deletion else []
-            if need_deletion and (no_deletions or unsatisfied):
-                deletion_nudges_used += 1
-                total_refinement_turns_used += 1
-                must_edit_after_gap = True
-                must_edit_patch = patch
-                marker = (
-                    "DELETION_NUDGE_QUEUED: no deletion lines"
-                    if no_deletions else
-                    "DELETION_NUDGE_QUEUED: named targets unsatisfied: " + ", ".join(unsatisfied[:4])
-                )
-                # Augment the existing deletion-nudge prompt with named targets
-                # when present.
-                prompt = build_deletion_nudge_prompt(issue)
-                if unsatisfied:
-                    prompt += (
-                        "\nNamed deletion targets parsed from the task that "
-                        "are NOT yet present in your deletion lines:\n  "
-                        + "\n  ".join(f"- `{t}`" for t in unsatisfied[:8])
-                        + "\nAct on each one explicitly.\n"
-                    )
-                queue_refinement_turn(
-                    assistant_text,
-                    prompt,
-                    marker,
-                )
-                return True
-
-        # Unsolicited-destructive-deletion gate: complement to the
-        # deletion-nudge above. Fires when the issue uses ONLY additive
-        # verbs but the patch contains a file with >10 substantive `-`
-        # lines and more removed than added. Targets the regression
-        # pattern where the model guts existing infrastructure during
-        # an "add a feature" task.
-        if destructive_deletion_nudges_used < MAX_DESTRUCTIVE_DELETION_NUDGES:
-            destructive_issues = _check_unsolicited_destructive_deletions(patch, issue)
-            if destructive_issues:
-                destructive_deletion_nudges_used += 1
-                total_refinement_turns_used += 1
-                must_edit_after_gap = True
-                must_edit_patch = patch
-                prompt = (
-                    "The task uses only additive verbs (add/create/update/etc.) "
-                    "with no removal verbs, but your patch contains large "
-                    "deletion blocks:\n  "
-                    + "\n  ".join(destructive_issues[:5])
-                    + "\n\nRestore the removed lines unless the deletion is "
-                    "strictly required by the task. When in doubt, keep the "
-                    "existing code and add your new changes alongside it. "
-                    "Then issue `<edit>` blocks to put the removed code back."
-                )
-                queue_refinement_turn(
-                    assistant_text,
-                    prompt,
-                    "DESTRUCTIVE_DELETION_QUEUED:\n  " + " | ".join(destructive_issues[:3]),
-                )
-                return True
-
-        # Criteria-nudge fires before coverage-nudge. Acceptance criteria bullets
-        # are directly scored by the LLM judge — addressing them is higher-value
-        # than covering additional file paths.
-        if criteria_nudges_used < MAX_CRITERIA_NUDGES:
-            unaddressed = _unaddressed_criteria(patch, issue)
-            if unaddressed:
-                criteria_nudges_used += 1
-                total_refinement_turns_used += 1
-                must_edit_after_gap = True
-                must_edit_patch = patch
-                queue_refinement_turn(
-                    assistant_text,
-                    build_criteria_nudge_prompt(unaddressed, issue),
-                    "CRITERIA_NUDGE_QUEUED:\n  " + " | ".join(c[:60] for c in unaddressed[:4]),
-                )
-                return True
-
-        # Mandatory pre-final checklist: when the model just emitted <final>
-        # and the issue had multiple requirements, force one explicit
-        # per-requirement verification pass. Pure prompt-driven self-check —
-        # the model must enumerate each Rn with ✅/❌ and fix any ❌ before
-        # the next <final> is accepted. Targets the dominant king failure
-        # mode (incomplete_coverage, ~58% of king losses): the model
-        # frequently believes it's done while leaving a requirement unmet.
-        if (final_checklist_used < MAX_FINAL_CHECKLIST_NUDGES
-                and "<final>" in (assistant_text or "").lower()):
-            requirements = _extract_acceptance_criteria(issue)
-            if len(requirements) >= 2:
-                final_checklist_used += 1
-                total_refinement_turns_used += 1
-                must_edit_after_gap = True
-                must_edit_patch = patch
-                queue_refinement_turn(
-                    assistant_text,
-                    build_final_checklist_prompt(requirements, issue),
-                    f"FINAL_CHECKLIST_QUEUED: {len(requirements)} requirements",
-                )
-                return True
-
-        if coverage_nudges_used < MAX_COVERAGE_NUDGES:
+            deletion_arg = (
+                (no_deletions, unsatisfied)
+                if (need_deletion and (no_deletions or unsatisfied))
+                else None
+            )
+            destructive_arg = _check_unsolicited_destructive_deletions(patch, issue) or None
+            criteria_arg = _unaddressed_criteria(patch, issue) or None
             missing = _uncovered_required_paths(patch, issue)
-            # king_analysis P1: issue says "move/relocate/rebuild as separate"
-            # but the patch contains no `new file mode` header — the model
-            # only edited the old-path file. Fire the same single-shot
-            # coverage nudge with a relocation-specific hint at the top.
             relocation_gap = (
                 _issue_implies_relocation(issue)
                 and not _patch_creates_any_new_file(patch)
             )
-            if missing or relocation_gap:
-                coverage_nudges_used += 1
+            coverage_arg = missing or None
+            removed_names = (
+                _patch_removed_definitions(patch) if (missing or relocation_gap) else None
+            )
+            final_reqs = None
+            if "<final>" in (assistant_text or "").lower():
+                _reqs = _extract_acceptance_criteria(issue)
+                if len(_reqs) >= 2:
+                    final_reqs = _reqs
+            prompt = build_completeness_prompt(
+                issue,
+                deletion=deletion_arg,
+                destructive=destructive_arg,
+                criteria=criteria_arg,
+                coverage=coverage_arg,
+                relocation_gap=relocation_gap,
+                removed_names=removed_names,
+                final_requirements=final_reqs,
+            )
+            if prompt:
+                completeness_turns_used += 1
                 total_refinement_turns_used += 1
                 must_edit_after_gap = True
                 must_edit_patch = patch
                 if relocation_gap:
                     logs.append("FIRE: relocation_gap_detected")
-                marker_paths = ", ".join(missing) if missing else "(no literal paths; relocation-only)"
-                marker = (
-                    "COVERAGE_NUDGE_QUEUED:\n  " + marker_paths
-                    + ("\n  [+relocation-gap]" if relocation_gap else "")
-                )
+                fired = [
+                    name for name, val in (
+                        ("deletion", deletion_arg),
+                        ("destructive", destructive_arg),
+                        ("criteria", criteria_arg),
+                        ("coverage", coverage_arg or relocation_gap),
+                        ("final-checklist", final_reqs),
+                    ) if val
+                ]
                 queue_refinement_turn(
                     assistant_text,
-                    build_coverage_nudge_prompt(
-                        missing, issue, relocation_gap=relocation_gap,
-                        removed_names=_patch_removed_definitions(patch),
-                    ),
-                    marker,
+                    prompt,
+                    "COMPLETENESS_QUEUED:\n  " + ", ".join(fired),
                 )
                 return True
 
-        if polish_turns_used < MAX_POLISH_TURNS:
-            junk = _diff_low_signal_summary(patch)
-            if junk:
-                polish_turns_used += 1
-                total_refinement_turns_used += 1
-                queue_refinement_turn(
-                    assistant_text,
-                    build_polish_prompt(junk),
-                    f"POLISH_TURN_QUEUED:\n  {junk}",
-                )
-                return True
-
-        if self_check_turns_used < MAX_SELF_CHECK_TURNS:
-            self_check_turns_used += 1
+        # --- Gate 4: final-review (merge of polish + self-check) ------------
+        if final_review_turns_used < 1:
+            final_review_turns_used += 1
             total_refinement_turns_used += 1
+            junk = _diff_low_signal_summary(patch)
             _inplace_adv = _check_inplace_intent(patch, issue, _tracked_set_for_checks)
             queue_refinement_turn(
                 assistant_text,
-                build_self_check_prompt(patch, issue, inplace_advisories=_inplace_adv),
-                "SELF_CHECK_QUEUED",
+                build_final_review_prompt(
+                    patch, issue, junk_summary=junk, inplace_advisories=_inplace_adv
+                ),
+                "FINAL_REVIEW_QUEUED" + (":\n  " + junk if junk else ""),
             )
             return True
 
@@ -9862,14 +9845,25 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # the probe can't starve the action loop. Best-effort — empty
         # results just leave the prompt unchanged.
         _baseline_failing_tests: List[Tuple[str, str]] = []
-        if _likely_tests and time_remaining() > 200.0:
+        _baseline_budget = time_remaining()
+        if _likely_tests and _baseline_budget > 115.0:
+            _baseline_max_tests = min(
+                3,
+                len(_likely_tests),
+                max(1, int((_baseline_budget - 100.0) // 50.0) + 1),
+            )
+            _baseline_timeout = 4 if _baseline_budget < 170.0 else 6
             _baseline_t0 = time.monotonic()
             _baseline_failing_tests = _run_failing_tests_baseline(
-                repo, _likely_tests, timeout_seconds=6, max_tests=3
+                repo,
+                _likely_tests,
+                timeout_seconds=_baseline_timeout,
+                max_tests=_baseline_max_tests,
             )
             logs.append(
                 "BASELINE_TESTS: "
-                f"checked={min(3, len(_likely_tests))} "
+                f"checked={min(_baseline_max_tests, len(_likely_tests))} "
+                f"timeout={_baseline_timeout}s "
                 f"failing={len(_baseline_failing_tests)} "
                 f"elapsed={time.monotonic() - _baseline_t0:.1f}s"
             )
@@ -9881,7 +9875,10 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         )
         _acceptance_criteria = _extract_acceptance_criteria(issue)
         if _acceptance_criteria and not _format_acceptance_rubric(issue).strip():
-            _criteria_lines = "\n".join(f"  - {c}" for c in _acceptance_criteria[:_CRITERIA_MAX_BULLETS])
+            _criteria_lines = "\n".join(
+                f"  {i + 1}. {c}"
+                for i, c in enumerate(_acceptance_criteria[:_CRITERIA_MAX_BULLETS])
+            )
             _initial_user_content += (
                 "\n\nAcceptance criteria checklist (address each before <final>):\n"
                 f"{_criteria_lines}\n"
@@ -10168,6 +10165,29 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     if success:
                         break
                     continue
+                if (
+                    verification_nudges_used < 1
+                    and time_remaining() >= _REFINEMENT_TIME_FLOOR_SECONDS
+                ):
+                    _final_verify = _suggest_targeted_test_command(
+                        repo,
+                        get_patch(repo),
+                        known_node_ids=known_test_node_ids,
+                        failed_node_ids=last_failed_test_names,
+                    )
+                    if _final_verify:
+                        verification_nudges_used += 1
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "You have a patch but have not run a targeted verification recently. "
+                                    "Run this command next, then fix any failures:\n"
+                                    f"  `{_final_verify}`"
+                                ),
+                            }
+                        )
+                        continue
                 logs.append("\nFINAL_SUMMARY:\n" + final)
                 success = True
 
@@ -10297,10 +10317,14 @@ def _looks_like_successful_test_output(observation: str, command: str = "") -> b
         " all passed",
         " tests passed",
         "success",
+        "test result: ok",
     ]
 
     if exit_code is not None and exit_code != 0:
         return False
+
+    if re.search(r"(?m)^ok$", lower):
+        return True
 
     has_good = any(marker in lower for marker in good_markers)
     has_bad = any(marker in lower for marker in bad_markers)
