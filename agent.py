@@ -5930,8 +5930,11 @@ def _patch_ship_blockers(patch: str, issue: str) -> List[str]:
     blockers: List[str] = []
     if not _patch_covers_required_paths(patch, issue):
         blockers.append("required_paths_uncovered")
-    if _issue_requires_deletion(issue) and not _patch_has_deletions(patch):
-        blockers.append("missing_required_deletions")
+    if _issue_requires_deletion(issue):
+        if not _patch_has_deletions(patch):
+            blockers.append("missing_required_deletions")
+        elif _named_deletions_unsatisfied(patch, issue):
+            blockers.append("specific_deletions_still_present")
     if _issue_implies_relocation(issue) and not _patch_creates_any_new_file(patch):
         blockers.append("relocation_incomplete")
     if len(_unaddressed_criteria(patch, issue)) >= 2:
@@ -8075,8 +8078,6 @@ _MULTISHOT_MIN_ATTEMPT_RESERVE = 52.0
 # attempt 1 was low-signal — otherwise the process often dies before the retry
 # finishes, which is worse than shipping the first (possibly thin) patch.
 _MULTISHOT_MAX_FIRST_ELAPSED = 132.0
-
-
 def _multishot_count_substantive(patch: str) -> int:
     if not patch.strip():
         return 0
@@ -8091,6 +8092,40 @@ def _multishot_count_substantive(patch: str) -> int:
             continue
         n += 1
     return n
+
+
+def _multishot_attempt_review_notes(
+    patch: str,
+    issue_text: str,
+    repo: Optional[Path] = None,
+) -> List[str]:
+    """Short notes used when asking the next pass to repair a weak draft."""
+    if not patch.strip():
+        return ["empty_patch"]
+    substantive = _multishot_count_substantive(patch)
+    notes: List[str] = []
+    if substantive < _MULTISHOT_LOW_SIGNAL_THRESHOLD:
+        notes.append(f"draft_needs_more_coverage:{substantive}")
+    notes.extend(_patch_ship_blockers(patch, issue_text))
+    named_deletions = _named_deletions_unsatisfied(patch, issue_text)
+    if named_deletions:
+        notes.append("specific_deletions_still_present:" + ",".join(named_deletions[:4]))
+    uncovered_paths = _uncovered_required_paths(patch, issue_text)
+    if uncovered_paths:
+        notes.append("uncovered_paths:" + ",".join(uncovered_paths[:4]))
+    remaining_criteria = _unaddressed_criteria(patch, issue_text)
+    if remaining_criteria and substantive < 6:
+        criteria_hint = "; ".join(c[:120] for c in remaining_criteria[:3])
+        notes.append("criteria_followup_needed:" + criteria_hint)
+    if repo is not None:
+        try:
+            syntax_errors = _check_syntax(repo, patch)
+            if syntax_errors:
+                syntax_hint = "; ".join(e[:140] for e in syntax_errors[:3])
+                notes.append("syntax_errors:" + syntax_hint)
+        except Exception:
+            pass
+    return notes
 
 
 def _multishot_capture_head(repo: Path) -> Optional[str]:
@@ -9778,6 +9813,7 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         # failure-mode diagnosis when we can pinpoint what went wrong.
         # The blockers list is still surfaced as a fallback when diagnosis
         # can't identify anything specific (rare but possible).
+        _attempt1_review_notes = _multishot_attempt_review_notes(_patch1, _issue_text, _multishot_repo_obj)
         _attempt1_diagnosis = _diagnose_attempt_failure(
             _patch1, _issue_text, _multishot_repo_obj
         )
@@ -9795,6 +9831,12 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                     + ", ".join(_attempt1_blockers)
                     + "\n"
                 )
+        if _attempt1_review_notes:
+            _bootstrap += (
+                "\nAttempt-1 review notes for the retry: "
+                + ", ".join(_attempt1_review_notes[:6])
+                + "\n"
+            )
         _attempt1_advisories = _emit_patch_quality_hints(_patch1, _issue_text, _multishot_repo_obj)
         if _attempt1_advisories:
             _bootstrap += (
