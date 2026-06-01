@@ -114,21 +114,10 @@ _RAPTOR_CLUSTER_SIZE = 6
 _RAPTOR_MAX_CLUSTERS = 24
 _RAPTOR_SUMMARY_CHARS = 400
 
-# Hybrid workflow: Generate–Prune–Select (Trae) + execution-free-first pipeline.
-# Sweet spot is 5–6 diverse candidates (performance declines beyond ~6).
-_GPS_MAX_CANDIDATES = 5
-_GPS_SELECTOR_MAX_INPUT = 6
-# Prompt diversity only — validator proxy owns all sampling/decoding params.
-_GPS_CODER_VARIANT_HINTS: Tuple[str, ...] = (
-    "Prefer the smallest surgical fix at the throw site.",
-    "Trace the call chain upward; fix the root cause, not a symptom.",
-    "Mirror the style of the surrounding module; change only what the issue requires.",
-    "If the issue names a test or error string, align the fix to that assertion.",
-    "Consider edge cases and backwards compatibility before editing.",
-)
-_PIPELINE_MAX_CANDIDATES = _GPS_MAX_CANDIDATES
-_PIPELINE_MAX_TOKENS = 1400
-_PIPELINE_TIMEOUT = 18
+# Hybrid workflow: optional single-shot pipeline before ReAct (traceback bugs only).
+_PIPELINE_MAX_CANDIDATES = 1
+_PIPELINE_MAX_TOKENS = 1536
+_PIPELINE_TIMEOUT = 22
 _PIPELINE_COMMAND_TIMEOUT = 15
 
 # Loop guards and companion-test targeting.
@@ -4746,6 +4735,173 @@ def _broken_refs_java(path: str, source: str, added: List[str], full: Path, repo
     return res
 
 
+# JS/TS removed-declaration patterns. Each regex captures the SYMBOL NAME that
+# the patch is deleting (matched against a `-` removed line, leading `-`
+# stripped). Conservative on purpose: only the simple, common forms.
+_JS_REMOVED_CONST_RE = re.compile(
+    r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*[:=]"
+)
+_JS_REMOVED_FUNC_RE = re.compile(
+    r"^\s*(?:export\s+)?(?:async\s+)?function\s+\*?\s*([A-Za-z_$][\w$]*)\s*[<(]"
+)
+_JS_REMOVED_CLASS_RE = re.compile(
+    r"^\s*(?:export\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)\b"
+)
+_JS_REMOVED_TYPE_RE = re.compile(
+    r"^\s*(?:export\s+)?(?:type|interface|enum)\s+([A-Za-z_$][\w$]*)\b"
+)
+
+
+def _removed_symbol_still_referenced_js_ts(repo: Path, patch: str) -> List[str]:
+    """JS/TS analog of Python's _deleted_symbol_still_referenced. Detects
+    same-file declarations the patch REMOVED whose name is still referenced in
+    the post-patch source. Loss family: a const/function/class is deleted but
+    a sibling shorthand-property or call site remains, yielding a `'X' is not
+    defined` / `Cannot find name 'X'` failure (duel 067444-style:
+    `readSessionMetaCwd` removed, `metaCwd,` shorthand stays).
+
+    Conservative gating:
+      - only `.js/.jsx/.ts/.tsx/.mjs/.cjs` files
+      - identifier must occur EXACTLY once post-patch (the residual reference)
+      - skip if the same name appears on any ADDED `+` line in the same file
+        (re-bind under a different form like `const X = useMemo(...)` is fine)
+      - <=3 findings to bound noise"""
+    findings: List[str] = []
+    try:
+        added_by_file = _patch_added_lines_by_file(patch)
+        removed_by_file = _patch_removed_lines_by_file(patch)
+        repo_resolved = repo.resolve()
+        for rel in _patch_changed_files(patch):
+            if len(findings) >= 3:
+                break
+            suffix = Path(rel).suffix.lower()
+            if suffix not in _JS_TS_IMPORT_SUFFIXES:
+                continue
+            full = (repo / rel).resolve()
+            try:
+                full.relative_to(repo_resolved)
+            except (ValueError, RuntimeError):
+                continue
+            if not full.is_file():
+                continue
+            source = _br_safe_read(full)
+            if source is None:
+                continue
+            added_blob = "".join(added_by_file.get(rel, []))
+            seen: set = set()
+            for raw in removed_by_file.get(rel, []):
+                stripped = raw.lstrip()
+                name: Optional[str] = None
+                kind: str = "binding"
+                for pat, k in (
+                    (_JS_REMOVED_CONST_RE, "const/let/var"),
+                    (_JS_REMOVED_FUNC_RE, "function"),
+                    (_JS_REMOVED_CLASS_RE, "class"),
+                    (_JS_REMOVED_TYPE_RE, "type"),
+                ):
+                    m = pat.match(stripped)
+                    if m:
+                        name = m.group(1)
+                        kind = k
+                        break
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                if not re.match(r"^[A-Za-z_$][\w$]*$", name) or len(name) < 2:
+                    continue
+                # If the patch ALSO added the same name back (any form), skip.
+                if re.search(r"(?<![\w$])" + re.escape(name) + r"(?![\w$])", added_blob):
+                    continue
+                # Identifier-use count in post-patch source. The DECLARATION
+                # is removed, so any remaining occurrence is a dangling ref.
+                occ = len(re.findall(r"(?<![\w$])" + re.escape(name) + r"(?![\w$])", source))
+                if occ >= 1:
+                    findings.append(
+                        f"removed_decl_still_referenced:{rel}: removed {kind} "
+                        f"`{name}` is still referenced in the post-patch file "
+                        f"(occurs {occ}x) — restore the declaration or remove "
+                        "the remaining references"
+                    )
+                if len(findings) >= 3:
+                    break
+    except Exception:
+        return findings[:3]
+    return findings[:3]
+
+
+# PHP `use` import: `use Vendor\Package\ClassName;` (with optional alias).
+_PHP_USE_RE = re.compile(
+    r"^\s*use\s+(?:function\s+|const\s+)?([A-Za-z_\\][\w\\]*?)(?:\s+as\s+([A-Za-z_]\w*))?\s*;"
+)
+_PHP_SUFFIXES = {".php", ".phtml"}
+
+
+def _removed_symbol_still_referenced_php(repo: Path, patch: str) -> List[str]:
+    """PHP analog: a `-use Vendor\\Foo;` removal still has `Foo` referenced in
+    the post-patch file (typehint, instantiation, static call, or extends).
+    Causal gate: name MUST be the short class name (after the last `\\` or the
+    alias if present), MUST occur post-removal, MUST NOT be re-added on a `+`
+    line in the same file (e.g. swap to a fully-qualified namespace use).
+    Duel 067372-style: `use Illuminate\\Http\\Request;` removed but
+    `Request $request` parameter remains in `store()`."""
+    findings: List[str] = []
+    try:
+        added_by_file = _patch_added_lines_by_file(patch)
+        removed_by_file = _patch_removed_lines_by_file(patch)
+        repo_resolved = repo.resolve()
+        for rel in _patch_changed_files(patch):
+            if len(findings) >= 3:
+                break
+            if Path(rel).suffix.lower() not in _PHP_SUFFIXES:
+                continue
+            full = (repo / rel).resolve()
+            try:
+                full.relative_to(repo_resolved)
+            except (ValueError, RuntimeError):
+                continue
+            if not full.is_file():
+                continue
+            source = _br_safe_read(full)
+            if source is None:
+                continue
+            added_blob = "".join(added_by_file.get(rel, []))
+            seen: set = set()
+            for raw in removed_by_file.get(rel, []):
+                stripped = raw.lstrip()
+                m = _PHP_USE_RE.match(stripped)
+                if not m:
+                    continue
+                fqn = m.group(1).strip()
+                alias = m.group(2)
+                short = alias if alias else fqn.rsplit("\\", 1)[-1]
+                if not short or not re.match(r"^[A-Za-z_]\w*$", short) or len(short) < 2:
+                    continue
+                if short in seen:
+                    continue
+                seen.add(short)
+                # Patch may re-add the same use line (e.g. reorder); skip.
+                if re.search(r"(?<![\w])" + re.escape(short) + r"(?![\w\\])", added_blob):
+                    if re.search(r"^\s*use\s+[\\\w]*" + re.escape(short) + r"\b", added_blob, re.MULTILINE):
+                        continue
+                # Look for the short name as a typehint, `new X(`, `X::method(`,
+                # `extends X`, `implements X`, `instanceof X` — generic word
+                # boundary catches all of these in PHP source.
+                occ_re = r"(?<![\w\\])" + re.escape(short) + r"(?![\w\\])"
+                # Don't count the removed use line itself — it's already gone.
+                occ = len(re.findall(occ_re, source))
+                if occ >= 1:
+                    findings.append(
+                        f"removed_use_still_referenced:{rel}: removed `use ...\\{short};` "
+                        f"but `{short}` is still referenced (occurs {occ}x as typehint/call/"
+                        "extend) — restore the use statement or remove the remaining references"
+                    )
+                if len(findings) >= 3:
+                    break
+    except Exception:
+        return findings[:3]
+    return findings[:3]
+
+
 def _check_broken_references(repo: Path, patch: str) -> List[str]:
     """Catch statically-evident broken code the parse-only check misses:
     duplicate top-level declarations/imports and dangling named imports from a
@@ -4788,6 +4944,20 @@ def _check_broken_references(repo: Path, patch: str) -> List[str]:
         pass
     try:
         findings.extend(_unused_added_variables(repo, patch))
+    except Exception:
+        pass
+    # Cross-language same-file removed-symbol-still-referenced (JS/TS/PHP).
+    # Mirrors the king's Python analog: a `-export function X` / `-const X =` /
+    # `-use Foo\Bar;` removal that the post-patch file still references is a
+    # compile error. Targets recurring duel losses 067444-style (TS:
+    # `readSessionMetaCwd` declaration removed but `metaCwd,` shorthand
+    # remains) and PHP `use ...Request;` removed-but-still-used cases.
+    try:
+        findings.extend(_removed_symbol_still_referenced_js_ts(repo, patch))
+    except Exception:
+        pass
+    try:
+        findings.extend(_removed_symbol_still_referenced_php(repo, patch))
     except Exception:
         pass
     out: List[str] = []
@@ -7468,268 +7638,6 @@ def _patch_duel_score(patch: str, issue: str) -> int:
     return score
 
 
-def _patch_ast_fingerprint(patch: str) -> str:
-    """AST-normalized structural fingerprint for Trae-style deduplication."""
-    import ast as _ast
-
-    per_file: Dict[str, List[str]] = {}
-    current: Optional[str] = None
-    for line in patch.splitlines():
-        if line.startswith("diff --git "):
-            m = re.match(r"diff --git a/.+? b/(.+?)$", line)
-            current = m.group(1) if m else None
-        elif (
-            current
-            and current.endswith(".py")
-            and line.startswith("+")
-            and not line.startswith("+++")
-        ):
-            per_file.setdefault(current, []).append(line[1:])
-    if not per_file:
-        return "hunk:" + str(sorted(_patch_hunk_signature(patch)))
-    parts: List[str] = []
-    for path in sorted(per_file):
-        snippet = "\n".join(per_file[path]).strip()
-        if not snippet:
-            parts.append(f"{path}:empty")
-            continue
-        try:
-            tree = _ast.parse(snippet)
-            parts.append(f"{path}:{_ast.dump(tree, include_attributes=False)}")
-        except SyntaxError:
-            normalized = "\n".join(ln.strip() for ln in per_file[path])
-            parts.append(f"{path}:raw:{hash(normalized)}")
-    return "|".join(parts)
-
-
-def _gps_dedupe_patches(candidates: List[Tuple[int, str]]) -> List[Tuple[int, str]]:
-    """Stage-1 prune: collapse AST- and hunk-identical samples."""
-    seen: set = set()
-    unique: List[Tuple[int, str]] = []
-    for idx, patch in candidates:
-        if not patch.strip():
-            continue
-        key = (_patch_ast_fingerprint(patch), str(sorted(_patch_hunk_signature(patch))))
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append((idx, patch))
-    return unique
-
-
-def _execution_free_reward_score(
-    patch: str,
-    issue_text: str,
-    *,
-    consensus_votes: int = 1,
-) -> float:
-    """SWE-RM style execution-free reward (trained on test labels; inferred without runs)."""
-    if not patch.strip():
-        return 0.0
-    score = float(_patch_duel_score(patch, issue_text))
-    score += 12.0 * max(0, consensus_votes - 1)
-    delta_lines = sum(
-        1
-        for ln in patch.splitlines()
-        if ln.startswith(("+", "-")) and not ln.startswith(("+++", "---"))
-    )
-    score -= min(8.0, delta_lines * 0.05)
-    score -= 25.0 * len(_patch_ship_blockers(patch, issue_text))
-    return max(0.0, score)
-
-
-@dataclass
-class _GpsCandidate:
-    source_idx: int
-    patch: str
-    reward: float
-    consensus_votes: int
-    regression_pass: Optional[bool] = None
-
-
-def _gps_prune_and_score(
-    raw: List[Tuple[int, str]],
-    issue_text: str,
-) -> List[_GpsCandidate]:
-    """Generate–Prune stage: dedup → execution-free reward + consensus votes."""
-    unique = _gps_dedupe_patches(raw)
-    if not unique:
-        return []
-    labeled = [(str(i), p) for i, (_, p) in enumerate(unique)]
-    clusters = _cluster_patches(labeled)
-    vote_by_local: Dict[int, int] = {}
-    for cluster in clusters:
-        for local_i in cluster:
-            vote_by_local[local_i] = len(cluster)
-    scored: List[_GpsCandidate] = []
-    for local_i, (orig_idx, patch) in enumerate(unique):
-        votes = vote_by_local.get(local_i, 1)
-        scored.append(
-            _GpsCandidate(
-                source_idx=orig_idx,
-                patch=patch,
-                reward=_execution_free_reward_score(patch, issue_text, consensus_votes=votes),
-                consensus_votes=votes,
-            )
-        )
-    scored.sort(key=lambda c: (-c.reward, -c.consensus_votes, len(c.patch)))
-    return scored[:_GPS_SELECTOR_MAX_INPUT]
-
-
-def _gps_regression_prune(
-    repo: Path,
-    candidates: List[_GpsCandidate],
-    issue_text: str,
-    baseline_failing: List[Tuple[str, str]],
-    command_timeout: int,
-    initial_head: str,
-) -> List[_GpsCandidate]:
-    """Stage-2 prune: regression-test unique candidates (SWE-HERO execution layer)."""
-    if not baseline_failing or not initial_head:
-        return candidates
-    passing: List[_GpsCandidate] = []
-    failing: List[_GpsCandidate] = []
-    for cand in candidates:
-        subprocess.run(
-            ["git", "reset", "--hard", initial_head],
-            cwd=str(repo), capture_output=True, timeout=30, check=False,
-        )
-        if not _multishot_apply_patch(repo, cand.patch):
-            failing.append(cand)
-            continue
-        if _validate_pipeline_patch(repo, issue_text, cand.patch, baseline_failing, command_timeout):
-            cand.regression_pass = True
-            passing.append(cand)
-        else:
-            cand.regression_pass = False
-            failing.append(cand)
-    if passing:
-        return passing + failing
-    return candidates
-
-
-def _gps_selector_dual_verify(
-    issue_text: str,
-    top: List[_GpsCandidate],
-    *,
-    infer_model: str,
-    infer_api_base: Optional[str],
-    infer_api_key: Optional[str],
-) -> Optional[int]:
-    """Trae Selector: contextual dual-verify when reward scores are ambiguous."""
-    if len(top) < 2:
-        return None
-    if top[0].reward - top[1].reward > 8.0:
-        return None
-    blocks: List[str] = []
-    for i, cand in enumerate(top[:3]):
-        blocks.append(
-            f"### Candidate {i + 1} (coder={cand.source_idx + 1}, "
-            f"reward={cand.reward:.0f}, votes={cand.consensus_votes})\n"
-            f"```diff\n{_truncate(cand.patch, 1400)}\n```"
-        )
-    prompt = (
-        "You are the Selector agent. Pick the ONE patch most likely to fix the "
-        "issue with the smallest correct change. Reply with ONLY a single digit "
-        "(1, 2, or 3).\n\n"
-        f"ISSUE:\n{_truncate(issue_text, 2000)}\n\n"
-        + "\n\n".join(blocks)
-    )
-    try:
-        response, _, _ = chat_completion(
-            messages=[
-                {"role": "system", "content": "Patch selector. Output one digit only."},
-                {"role": "user", "content": prompt},
-            ],
-            model=infer_model,
-            api_base=infer_api_base,
-            api_key=infer_api_key,
-            max_tokens=8,
-            timeout=12,
-            max_retries=1,
-        )
-    except Exception:
-        return None
-    m = re.search(r"[123]", (response or "").strip())
-    if not m:
-        return None
-    pick = int(m.group(0)) - 1
-    return pick if 0 <= pick < len(top[:3]) else None
-
-
-def _gps_selector_pick(
-    issue_text: str,
-    candidates: List[_GpsCandidate],
-    *,
-    infer_model: str,
-    infer_api_base: Optional[str],
-    infer_api_key: Optional[str],
-) -> _GpsCandidate:
-    """Pick winner: regression pass > reward > consensus > optional LLM verify."""
-    if not candidates:
-        raise ValueError("empty candidate pool")
-    regress_pass = [c for c in candidates if c.regression_pass is True]
-    pool = regress_pass if regress_pass else candidates
-    pool = sorted(pool, key=lambda c: (-c.reward, -c.consensus_votes, len(c.patch)))
-    dual_idx = _gps_selector_dual_verify(
-        issue_text,
-        pool[:3],
-        infer_model=infer_model,
-        infer_api_base=infer_api_base,
-        infer_api_key=infer_api_key,
-    )
-    if dual_idx is not None and dual_idx < len(pool[:3]):
-        return pool[:3][dual_idx]
-    return pool[0]
-
-
-def _pick_stronger_patch_execution_free(
-    issue_text: str,
-    patch_a: str,
-    label_a: str,
-    patch_b: str,
-    label_b: str,
-    inference_cfg: Optional[Tuple[Optional[str], Optional[str], Optional[str]]] = None,
-) -> Tuple[str, str]:
-    """Dual-workflow duel: SWE-RM reward first; LLM selector only when tied."""
-    if not patch_a.strip():
-        return patch_b, label_b
-    if not patch_b.strip():
-        return patch_a, label_a
-    score_a = _execution_free_reward_score(patch_a, issue_text)
-    score_b = _execution_free_reward_score(patch_b, issue_text)
-    margin = 10.0
-    if score_a >= score_b + margin:
-        return patch_a, label_a
-    if score_b >= score_a + margin:
-        return patch_b, label_b
-    if inference_cfg and all(inference_cfg):
-        try:
-            model_name, base, key = _resolve_inference_config(*inference_cfg)
-            pool = [
-                _GpsCandidate(0, patch_a, score_a, 1),
-                _GpsCandidate(1, patch_b, score_b, 1),
-            ]
-            pick = _gps_selector_dual_verify(
-                issue_text,
-                pool,
-                infer_model=model_name,
-                infer_api_base=base,
-                infer_api_key=key,
-            )
-            if pick == 1:
-                return patch_b, label_b
-            if pick == 0:
-                return patch_a, label_a
-        except Exception:
-            pass
-    if score_b > score_a:
-        return patch_b, label_b
-    if score_a > score_b:
-        return patch_a, label_a
-    return (patch_a, label_a) if len(patch_a) <= len(patch_b) else (patch_b, label_b)
-
-
 def build_ship_blocker_prompt(blockers: List[str], issue: str) -> str:
     short = issue[:1200] if len(issue) > 1200 else issue
     items = "\n".join(f"  - {b}" for b in blockers[:6])
@@ -8644,12 +8552,6 @@ Evidence priority when picking what to patch: explicit issue text > failing/expe
 INSPECTION STRATEGY
 ====================================================================
 
-====================================================================
-REASONING BEFORE EXECUTION (SWE-ZERO → SWE-HERO)
-====================================================================
-
-Internalize the bug from the issue text and code reading before running tests. Early turns should be read-only inspection (`grep`, `sed`, repo map, targeted file reads). Run tests only after you have a concrete hypothesis and a minimal fix direction — execution verifies semantics; it should not be your primary discovery loop.
-
 Inspect only what you need to locate the owner of the bug and patch safely. Order: **repo map (symbol skeleton) first** to pick the right file/class/function, then the localized preloaded regions (not whole files), then one or two focused searches (`grep -rn`, or `grep -rnF` for an exact phrase; `rg` is NOT available here), then `sed -n` on the line numbers from the map, then nearby tests, then call sites only if a signature/public API may change.
 
 When the issue quotes a long error message, stack trace line, or expected output (20+ characters in quotes or backticks), `grep -rnF` that exact phrase first — it usually lands on the throw site or test assertion you must edit.
@@ -8726,6 +8628,10 @@ Error messages are often tested exactly. When changing one, match capitalization
 **No field-name aliasing.** Reuse a field's canonical name end to end — never expose, map, or serialize an existing field under a second name. No serializer `source=`/`alias=` rename, no `{camelName: obj.snake_name}` remap in a selector or response builder, no getter/property that merely re-points to an existing field. The consumer (UI, test, API client) reads the canonical key; an alias delivers the value under the wrong key and leaves the expected key missing. If the issue explicitly asks to RENAME a field, change it everywhere and remove the old name — do not add the alias alongside it.
 
 **Preserve conditional logic during refactors.** When simplifying or refactoring existing code, do NOT collapse a conditional branch (`a ? x : y`, `if a: x else: y`, `match x: case A => ... case B => ...`) into a single literal. The conditional exists because two cases produce different values. Hardcoding one breaks the other. Concrete example: turning `color: isMine ? '#fff' : '#1e293b'` into `color: '#fff'` makes received messages invisible on white backgrounds. If you don't understand why a conditional is there, keep it as-is — investigate before deleting branches.
+
+**Removal safety.** When your patch DELETES a declaration (function, class, const/let/var, import, `use` statement, trait, type/interface), trace EVERY reference to that symbol BEFORE finalising. Either restore the declaration OR also remove every remaining reference. A half-removal compiles only at the file that lost the declaration; importers, callers, JSX usages, shorthand-property references, and typehints that survive will fail at parse or load time. Recurring patterns: removing `import X from 'mod'` while keeping `<X />` or `X(` references; removing `use Illuminate\\Http\\Request;` while keeping `Request $request` parameters in the same controller; removing `const foo = ...` while a sibling `{ foo, bar }` object shorthand still references it; removing a Rust trait impl while keeping its method calls. Before emitting `<final>`, grep the post-patch file for every removed identifier and confirm zero dangling references.
+
+**New-file completeness.** Every NEW file you create MUST contain real implementation code (at minimum three substantive non-trivial lines — not just a stub, `pass`, `// TODO`, or a single import). Creating a file whose body is empty (which git records as the canonical empty blob hash `e69de29`) breaks every importer and is a guaranteed task failure: the validator's referenced-empty-file gate will reject it. If the issue lists multiple new files and your remaining time budget does not allow implementing all of them, IMPLEMENT FEWER FILES COMPLETELY rather than scaffolding many empty stubs. A patch that omits a required file is recoverable; a patch that creates an empty file at an importer's target path is not.
 
 Preserve public API and backwards compatibility unless the issue explicitly requires a breaking change: function/method names, signatures, exported types, CLI flags, config keys, response shapes, error classes, schemas, file formats, env-var names.
 
@@ -10524,7 +10430,17 @@ def _patch_has_probable_duplicate_function_decls(patch: str) -> bool:
 
 
 def _patch_has_probable_duplicate_imports(patch: str) -> bool:
-    """Cheap pre-scan: repeated normalized import on '+' lines in one file block."""
+    """Cheap pre-scan: repeated normalized import on '+' lines in one file block.
+
+    Two complementary signals:
+      (a) The same NORMALISED import statement added twice (king's original
+          check — catches verbatim repeats);
+      (b) The same JS/TS NAMED-IMPORT BINDING added twice from DIFFERENT
+          modules (e.g. `+import { X } from 'a'` and `+import { X } from 'b'`
+          in the same file) — TypeScript fails with `Cannot redeclare
+          block-scoped variable 'X'`. Duel 067388-style: two `import` lines
+          declaring the same binding compile-fail before any runtime check.
+    """
     if not patch.strip() or "diff --git " not in patch:
         return False
     try:
@@ -10543,6 +10459,10 @@ def _patch_has_probable_duplicate_imports(patch: str) -> bool:
             else:
                 continue
             seen: set = set()
+            # Signal (b): track which JS/TS named-import bindings the patch
+            # adds; same binding from any two modules = redeclare error.
+            seen_bindings: set = set()
+            is_js_ts = path.endswith(_LINT_JS_TS_EXTS)
             for ln in block.splitlines():
                 m = pat.match(ln)
                 if not m:
@@ -10551,6 +10471,25 @@ def _patch_has_probable_duplicate_imports(patch: str) -> bool:
                 if norm in seen:
                     return True
                 seen.add(norm)
+                if is_js_ts:
+                    # Extract named-import binding identifiers (handles `as`).
+                    # `import { Foo, Bar as B } from 'mod'` → {Foo, B}.
+                    bm = re.search(r"\{([^}]*)\}", norm)
+                    if bm:
+                        for raw in bm.group(1).split(","):
+                            name = raw.strip().split(" as ")[-1].strip()
+                            if name and re.match(r"^[A-Za-z_$][\w$]*$", name):
+                                if name in seen_bindings:
+                                    return True
+                                seen_bindings.add(name)
+                    # Default binding: `import X from '...'` or
+                    # `import X, { Y } from '...'`.
+                    dm = re.match(r"^import\s+(?:type\s+)?([A-Za-z_$][\w$]*)\s*[,\s]", norm)
+                    if dm:
+                        name = dm.group(1)
+                        if name in seen_bindings:
+                            return True
+                        seen_bindings.add(name)
         return False
     except Exception:
         return True
@@ -11473,22 +11412,17 @@ def _generate_pipeline_candidate(
     api_base: Optional[str],
     api_key: Optional[str],
     candidate_idx: int,
-    variant_hint: str = "",
-    execution_free: bool = True,
 ) -> str:
-    """Coder agent: single-shot candidate patch (SWE-ZERO execution-free by default)."""
+    """Single-shot candidate patch via structured edits."""
     snippets: List[str] = []
     for path in target_files[:3]:
         snip = _read_context_file(repo, path, 2500)
         if snip.strip():
             snippets.append(f"### {path}\n```\n{snip}\n```")
-    variant_line = f"\nStrategy hint: {variant_hint}\n" if variant_hint else ""
     prompt = (
-        f"You are a Coder agent (sample {candidate_idx + 1}/{_GPS_MAX_CANDIDATES}). "
-        "Reason about the fix from the issue and code context without running tests. "
-        "Emit ONLY `<edit>` blocks, then `<final>pipeline candidate</final>`. "
-        "Smallest root-cause fix."
-        f"{variant_line}\n\n"
+        f"You are an agentless patch generator (candidate {candidate_idx + 1}). "
+        "Emit ONLY `<edit>` blocks (and optionally one `<command>` test), then "
+        "`<final>pipeline candidate</final>`. Smallest root-cause fix.\n\n"
         f"ISSUE:\n{_truncate(issue_text, 2000)}\n\n"
         f"LOCALIZATION:\n{_truncate(localization_ctx, 4000)}\n\n"
         + "\n\n".join(snippets)
@@ -11496,7 +11430,7 @@ def _generate_pipeline_candidate(
     try:
         response, _, _ = chat_completion(
             messages=[
-                {"role": "system", "content": "Coder agent. Output edits only; no test commands."},
+                {"role": "system", "content": "Agentless patch generator. Output edits only."},
                 {"role": "user", "content": prompt},
             ],
             model=model,
@@ -11511,20 +11445,20 @@ def _generate_pipeline_candidate(
     for kind, value in extract_actions_in_order(response or ""):
         if kind == "edit":
             execute_edit(value, repo)
-        elif kind == "command" and not execution_free:
+        elif kind == "command":
             run_command(value, repo, timeout=_PIPELINE_COMMAND_TIMEOUT)
     return get_patch(repo)
 
 
 def _run_agentless_pipeline(**kwargs: Any) -> Dict[str, Any]:
-    """Generate–Prune–Select: Coder pool → dedup/reward prune → regression → Selector."""
+    """Fixed pipeline: localization → candidate patches → validation."""
     repo_path = kwargs["repo_path"]
     issue = kwargs["issue"]
     model = kwargs.get("model")
     api_base = kwargs.get("api_base")
     api_key = kwargs.get("api_key")
     command_timeout = kwargs.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)
-    logs: List[str] = ["GPS_PIPELINE: start (generate → prune → select)"]
+    logs: List[str] = ["AGENTLESS_PIPELINE: start"]
     try:
         repo = _repo_path(repo_path)
         ensure_git_repo(repo)
@@ -11541,90 +11475,35 @@ def _run_agentless_pipeline(**kwargs: Any) -> Dict[str, Any]:
             capture_output=True, text=True, timeout=10, check=False,
         ).stdout.strip()
 
-        # Phase 1 (SWE-ZERO): execution-free generation — K diverse Coder samples.
-        raw_generated: List[Tuple[int, str]] = []
+        best_patch = ""
         for idx in range(_PIPELINE_MAX_CANDIDATES):
             if initial_head:
                 subprocess.run(
                     ["git", "reset", "--hard", initial_head],
                     cwd=str(repo), capture_output=True, timeout=30, check=False,
                 )
-            variant = _GPS_CODER_VARIANT_HINTS[idx % len(_GPS_CODER_VARIANT_HINTS)]
             patch = _generate_pipeline_candidate(
                 repo, issue, loc_ctx, target_files,
                 model=model_name, api_base=base, api_key=key, candidate_idx=idx,
-                variant_hint=variant, execution_free=True,
             )
-            logs.append(
-                f"GPS_GENERATE_{idx + 1}: patch_chars={len(patch)} variant={idx}"
-            )
-            if patch.strip():
-                raw_generated.append((idx, patch))
-
-        if not raw_generated:
-            logs.append("GPS_EMPTY_POOL: handing off to ReAct agent")
-            return AgentResult(
-                patch="", logs=_safe_join_logs(logs),
-                steps=_PIPELINE_MAX_CANDIDATES, cost=0.0, success=False,
-            ).to_dict() | {"localization_context": loc_ctx}
-
-        # Phase 2 (Prune): AST/hunk dedup + execution-free reward + consensus votes.
-        pruned = _gps_prune_and_score(raw_generated, issue)
-        logs.append(
-            "GPS_PRUNE: "
-            f"generated={len(raw_generated)} unique_scored={len(pruned)}"
-        )
-
-        # Phase 3 (SWE-HERO): execution-backed regression prune on diverse survivors.
-        pruned = _gps_regression_prune(
-            repo, pruned, issue, baseline_failing, command_timeout, initial_head,
-        )
-        regress_ok = sum(1 for c in pruned if c.regression_pass is True)
-        logs.append(f"GPS_REGRESSION: pass={regress_ok} pool={len(pruned)}")
-
-        # Early exit: any regression-passing candidate ships immediately.
-        for cand in pruned:
-            if cand.regression_pass is True:
-                logs.append(
-                    f"GPS_SUCCESS: coder={cand.source_idx + 1} "
-                    f"reward={cand.reward:.0f} votes={cand.consensus_votes}"
-                )
-                if initial_head:
-                    subprocess.run(
-                        ["git", "reset", "--hard", initial_head],
-                        cwd=str(repo), capture_output=True, timeout=30, check=False,
-                    )
-                    _multishot_apply_patch(repo, cand.patch)
-                logs.append(
-                    f"GPS_WINNER: coder={cand.source_idx + 1} "
-                    f"reward={cand.reward:.0f} votes={cand.consensus_votes}"
-                )
+            logs.append(f"PIPELINE_CANDIDATE_{idx + 1}: patch_chars={len(patch)}")
+            if _validate_pipeline_patch(repo, issue, patch, baseline_failing, command_timeout):
+                logs.append(f"PIPELINE_SUCCESS: candidate={idx + 1}")
                 return AgentResult(
-                    patch=cand.patch, logs=_safe_join_logs(logs),
-                    steps=cand.source_idx + 1, cost=0.0, success=True,
-                ).to_dict() | {"localization_context": loc_ctx}
+                    patch=patch, logs=_safe_join_logs(logs),
+                    steps=idx + 1, cost=0.0, success=True,
+                ).to_dict() | {"localization_context": loc_ctx, "pipeline_candidate": idx + 1}
+            if patch.strip() and len(patch) > len(best_patch):
+                best_patch = patch
 
-        # Phase 4 (Selector): reward + dual-verify; hand best patch to ReAct if none pass.
-        winner = _gps_selector_pick(
-            issue,
-            pruned,
-            infer_model=model_name,
-            infer_api_base=base,
-            infer_api_key=key,
-        )
-        logs.append(
-            "GPS_SELECT: "
-            f"coder={winner.source_idx + 1} reward={winner.reward:.0f} "
-            f"votes={winner.consensus_votes} regress={winner.regression_pass}"
-        )
+        logs.append("PIPELINE_NO_VALID_CANDIDATE: handing off to ReAct agent")
         if initial_head:
             subprocess.run(
                 ["git", "reset", "--hard", initial_head],
                 cwd=str(repo), capture_output=True, timeout=30, check=False,
             )
-        logs.append("GPS_NO_REGRESSION_PASS: handing off to ReAct agent")
         return AgentResult(
-            patch=winner.patch, logs=_safe_join_logs(logs),
+            patch=best_patch, logs=_safe_join_logs(logs),
             steps=_PIPELINE_MAX_CANDIDATES, cost=0.0, success=False,
         ).to_dict() | {"localization_context": loc_ctx}
     except Exception:
@@ -11640,7 +11519,6 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
     _route = _classify_issue_route(_issue_for_route)
     _pipeline_localization = kwargs.get("_pipeline_localization", "")
     _pipeline_fast_result: Optional[Dict[str, Any]] = None
-    _pipeline_handoff_patch = ""
     if _route != "agent" and not kwargs.get("_skip_pipeline"):
         _pipe = _run_agentless_pipeline(**kwargs)
         if _pipe.get("success") and (_pipe.get("patch") or "").strip():
@@ -11649,7 +11527,6 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             _pipeline_fast_result = _pipe
         else:
             _pipeline_localization = _pipe.get("localization_context") or _pipeline_localization
-            _pipeline_handoff_patch = (_pipe.get("patch") or "").strip()
             kwargs = {**kwargs, "_pipeline_localization": _pipeline_localization}
     kwargs = {**kwargs, "_hybrid_route": _route}
     repo_path = kwargs["repo_path"]
@@ -11975,24 +11852,8 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
             return _finalize(_maybe_emergency(_result1, _multishot_started))
 
         clusters = _cluster_patches([(c[0], c[2]) for c in candidates])
-        cluster_votes: Dict[int, int] = {}
-        for cluster in clusters:
-            for i in cluster:
-                cluster_votes[i] = len(cluster)
-        # Sort clusters: largest first, tiebreak by max execution-free reward in cluster
-        clusters.sort(
-            key=lambda cl: (
-                -len(cl),
-                -max(
-                    _execution_free_reward_score(
-                        candidates[i][2],
-                        _issue_text,
-                        consensus_votes=cluster_votes.get(i, 1),
-                    )
-                    for i in cl
-                ),
-            )
-        )
+        # Sort clusters: largest first, tiebreak by max score in cluster
+        clusters.sort(key=lambda cl: (-len(cl), -max(candidates[i][3] for i in cl)))
         winner_cluster = clusters[0]
 
         # Variance reduction: when 2-3 attempts all produced distinct answers
@@ -12046,19 +11907,8 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                         except Exception:
                             pass
 
-        # Within the largest cluster: execution-free reward, then duel score, substance.
-        winner_idx = max(
-            winner_cluster,
-            key=lambda i: (
-                _execution_free_reward_score(
-                    candidates[i][2],
-                    _issue_text,
-                    consensus_votes=cluster_votes.get(i, 1),
-                ),
-                candidates[i][3],
-                candidates[i][4],
-            ),
-        )
+        # Within the largest cluster, pick by score then by line count.
+        winner_idx = max(winner_cluster, key=lambda i: (candidates[i][3], candidates[i][4]))
 
         _winner_label, _winner_result, _winner_patch, _winner_score, _winner_n = candidates[winner_idx]
         # Telemetry: flag low-confidence ship for downstream debugging
@@ -12074,29 +11924,6 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _winner_result["multishot_winner"] = _winner_label
         _winner_result["multishot_cluster_size"] = len(winner_cluster)
         _winner_result["multishot_total_candidates"] = len(candidates)
-
-        # Dual workflow: GPS handoff vs ReAct winner (execution-free reward + selector).
-        if _pipeline_handoff_patch and (_winner_patch or "").strip():
-            _picked_patch, _picked_label = _pick_stronger_patch_execution_free(
-                _issue_text,
-                _pipeline_handoff_patch,
-                "gps",
-                _winner_patch,
-                _winner_label,
-                inference_cfg=(
-                    kwargs.get("model"),
-                    kwargs.get("api_base"),
-                    kwargs.get("api_key"),
-                ),
-            )
-            if _picked_patch != _winner_patch:
-                if _multishot_repo_obj is not None and _multishot_initial_head:
-                    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-                    _multishot_apply_patch(_multishot_repo_obj, _picked_patch)
-                _winner_result["patch"] = _picked_patch
-            if _picked_label == "gps":
-                _winner_result["multishot_winner"] = "gps_over_react"
-
         return _finalize(_maybe_emergency(_winner_result, _multishot_started))
 
     except Exception as exc:
