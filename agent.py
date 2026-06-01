@@ -2861,6 +2861,17 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         files, symbol_index, graph_nodes, graph_edges, issue,
     )
 
+    # Remove duplicate paths introduced by different retrieval passes while
+    # preserving rank order.
+    deduped_files: List[str] = []
+    seen_files = set()
+    for relative_path in files:
+        if relative_path in seen_files:
+            continue
+        seen_files.add(relative_path)
+        deduped_files.append(relative_path)
+    files = deduped_files
+
     # Rescue-ranker: weak top_score means no path mention and no symbol-grep
     # hit landed, so the top-ranked file is essentially random — this is
     # the dominant catastrophic-floor failure mode. Run a cheap broad-grep
@@ -2881,7 +2892,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     # Expand wiring/siblings before test partners so late-added sources still
     # receive tests/test_foo.py in preload (see _backfill_companion_tests_*).
     files = _augment_with_integration_partners(files, tracked_set, issue)
-    files = _augment_with_directory_siblings(files, tracked_set)
+    files = _augment_with_directory_siblings(files, tracked_set, issue)
     files = _augment_with_test_partners(files, tracked_set)
     if _companion_test_preload_gaps(files, tracked_set) > 0:
         files = _backfill_companion_tests_after_expansion(files, tracked_set)
@@ -3228,33 +3239,51 @@ _DIRECTORY_SIBLING_BASENAMES = {
 
 
 def _augment_with_directory_siblings(
-    files: List[str], tracked_set: set, limit: int = 3
+    files: List[str], tracked_set: set, issue: str = "", limit: int = 5
 ) -> List[str]:
-    """Append same-directory siblings of the top-ranked file that the pipeline hasn't included yet.
+    """Append ranked same-directory siblings for the top context anchors.
 
     Targets high-leverage basenames (layout, index, schema, etc.) that commonly
-    need co-editing on multi-file tasks. Uses only set membership — no I/O, no subprocess.
+    need co-editing on multi-file tasks. The ranking now considers the top few
+    anchors instead of only `files[0]`, so a correct second/third hit can still
+    pull in its local wiring file without displacing the primary ranked files.
+    Uses only set membership/string scoring — no I/O, no subprocess.
     """
     try:
         if not files:
             return files
-        top = files[0]
-        top_dir = str(Path(top).parent).replace("\\", "/")
-        if top_dir in {"", "."}:
+        anchors = files[:4]
+        anchor_dirs: Dict[str, int] = {}
+        anchor_tokens = set()
+        for rank, anchor in enumerate(anchors):
+            parent = str(Path(anchor).parent).replace("\\", "/")
+            if parent in {"", "."}:
+                continue
+            anchor_dirs.setdefault(parent, rank)
+            anchor_tokens.update(_split_path_tokens(anchor))
+        if not anchor_dirs:
             return files
+        issue_tokens = {term for term in _issue_terms(issue) if len(term) >= 4}
+        signal_tokens = issue_tokens | {token for token in anchor_tokens if len(token) >= 4}
         seen = set(files)
-        siblings: List[str] = []
-        for candidate in tracked_set:
+        siblings: List[Tuple[int, str]] = []
+        for candidate in sorted(tracked_set):
             if candidate in seen:
                 continue
             cpath = Path(candidate)
-            if str(cpath.parent).replace("\\", "/") != top_dir:
+            parent = str(cpath.parent).replace("\\", "/")
+            if parent not in anchor_dirs:
                 continue
+            score = max(0, 8 - anchor_dirs[parent])
             if cpath.stem.lower() in _DIRECTORY_SIBLING_BASENAMES:
-                siblings.append(candidate)
-            if len(siblings) >= limit:
-                break
-        return files + siblings[:limit]
+                score += 6
+            path_lower = candidate.lower()
+            score += min(6, 2 * sum(1 for token in issue_tokens if token in path_lower))
+            score += min(4, sum(1 for token in signal_tokens if token in path_lower))
+            if score >= 8:
+                siblings.append((score, candidate))
+        siblings.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
+        return files + [candidate for _score, candidate in siblings[:limit]]
     except Exception:
         return files
 
@@ -3433,7 +3462,9 @@ def _read_context_file(
         return ""
     text = data.decode("utf-8", errors="replace")
     if needles:
-        return _extract_relevant_regions(text, needles, max_chars)
+        extracted = _extract_relevant_regions(text, needles, max_chars)
+        if extracted.strip():
+            return extracted
     return _truncate(text, max_chars)
 
 
