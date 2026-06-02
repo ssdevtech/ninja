@@ -1717,7 +1717,6 @@ def _skeleton_symbols_from_regex(text: str, suffix: str) -> List[SkeletonSymbol]
     seen: set = set()
 
     def add(kind: str, name: str, line_no: int) -> None:
-        key = (kind, name, line_no)
         if name in seen or len(out) >= 64:
             return
         seen.add(name)
@@ -2861,17 +2860,6 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         files, symbol_index, graph_nodes, graph_edges, issue,
     )
 
-    # Remove duplicate paths introduced by different retrieval passes while
-    # preserving rank order.
-    deduped_files: List[str] = []
-    seen_files = set()
-    for relative_path in files:
-        if relative_path in seen_files:
-            continue
-        seen_files.add(relative_path)
-        deduped_files.append(relative_path)
-    files = deduped_files
-
     # Rescue-ranker: weak top_score means no path mention and no symbol-grep
     # hit landed, so the top-ranked file is essentially random — this is
     # the dominant catastrophic-floor failure mode. Run a cheap broad-grep
@@ -2892,7 +2880,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     # Expand wiring/siblings before test partners so late-added sources still
     # receive tests/test_foo.py in preload (see _backfill_companion_tests_*).
     files = _augment_with_integration_partners(files, tracked_set, issue)
-    files = _augment_with_directory_siblings(files, tracked_set, issue)
+    files = _augment_with_directory_siblings(files, tracked_set)
     files = _augment_with_test_partners(files, tracked_set)
     if _companion_test_preload_gaps(files, tracked_set) > 0:
         files = _backfill_companion_tests_after_expansion(files, tracked_set)
@@ -2915,8 +2903,6 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         if rank_idx < _RANK_AWARE_TOP_TIER + 6:
             return _RANK_AWARE_MID_BUDGET
         return _RANK_AWARE_LOW_BUDGET
-    # Fallback budget for code paths that don't use rank index (rescue files, etc).
-    per_file_budget = _RANK_AWARE_MID_BUDGET
 
     if rescue_files:
         # Banner is small and high-leverage; surface BEFORE the snippet
@@ -3239,51 +3225,33 @@ _DIRECTORY_SIBLING_BASENAMES = {
 
 
 def _augment_with_directory_siblings(
-    files: List[str], tracked_set: set, issue: str = "", limit: int = 5
+    files: List[str], tracked_set: set, limit: int = 3
 ) -> List[str]:
-    """Append ranked same-directory siblings for the top context anchors.
+    """Append same-directory siblings of the top-ranked file that the pipeline hasn't included yet.
 
     Targets high-leverage basenames (layout, index, schema, etc.) that commonly
-    need co-editing on multi-file tasks. The ranking now considers the top few
-    anchors instead of only `files[0]`, so a correct second/third hit can still
-    pull in its local wiring file without displacing the primary ranked files.
-    Uses only set membership/string scoring — no I/O, no subprocess.
+    need co-editing on multi-file tasks. Uses only set membership — no I/O, no subprocess.
     """
     try:
         if not files:
             return files
-        anchors = files[:4]
-        anchor_dirs: Dict[str, int] = {}
-        anchor_tokens = set()
-        for rank, anchor in enumerate(anchors):
-            parent = str(Path(anchor).parent).replace("\\", "/")
-            if parent in {"", "."}:
-                continue
-            anchor_dirs.setdefault(parent, rank)
-            anchor_tokens.update(_split_path_tokens(anchor))
-        if not anchor_dirs:
+        top = files[0]
+        top_dir = str(Path(top).parent).replace("\\", "/")
+        if top_dir in {"", "."}:
             return files
-        issue_tokens = {term for term in _issue_terms(issue) if len(term) >= 4}
-        signal_tokens = issue_tokens | {token for token in anchor_tokens if len(token) >= 4}
         seen = set(files)
-        siblings: List[Tuple[int, str]] = []
-        for candidate in sorted(tracked_set):
+        siblings: List[str] = []
+        for candidate in tracked_set:
             if candidate in seen:
                 continue
             cpath = Path(candidate)
-            parent = str(cpath.parent).replace("\\", "/")
-            if parent not in anchor_dirs:
+            if str(cpath.parent).replace("\\", "/") != top_dir:
                 continue
-            score = max(0, 8 - anchor_dirs[parent])
             if cpath.stem.lower() in _DIRECTORY_SIBLING_BASENAMES:
-                score += 6
-            path_lower = candidate.lower()
-            score += min(6, 2 * sum(1 for token in issue_tokens if token in path_lower))
-            score += min(4, sum(1 for token in signal_tokens if token in path_lower))
-            if score >= 8:
-                siblings.append((score, candidate))
-        siblings.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
-        return files + [candidate for _score, candidate in siblings[:limit]]
+                siblings.append(candidate)
+            if len(siblings) >= limit:
+                break
+        return files + siblings[:limit]
     except Exception:
         return files
 
@@ -3462,9 +3430,7 @@ def _read_context_file(
         return ""
     text = data.decode("utf-8", errors="replace")
     if needles:
-        extracted = _extract_relevant_regions(text, needles, max_chars)
-        if extracted.strip():
-            return extracted
+        return _extract_relevant_regions(text, needles, max_chars)
     return _truncate(text, max_chars)
 
 
@@ -6233,11 +6199,64 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             result = _check_rust_syntax_one(repo, relative_path)
         elif suffix in {".cc", ".cpp", ".cxx", ".c", ".h", ".hpp"}:
             result = _check_cpp_syntax_one(repo, relative_path)
+        elif suffix in {".ts", ".tsx", ".mts", ".cts"}:
+            try:
+                result = _check_ts_syntax_one(repo, relative_path)
+            except Exception:
+                result = None
+        elif suffix in {".java"}:
+            try:
+                result = _check_java_syntax_one(repo, relative_path)
+            except Exception:
+                result = None
+        elif suffix in {".kt", ".kts"}:
+            try:
+                result = _check_kotlin_syntax_one(repo, relative_path)
+            except Exception:
+                result = None
+        elif suffix == ".swift":
+            try:
+                result = _check_swift_syntax_one(repo, relative_path)
+            except Exception:
+                result = None
+        elif suffix in {".yml", ".yaml"}:
+            try:
+                result = _check_yaml_syntax_one(repo, relative_path)
+            except Exception:
+                result = None
+        elif suffix == ".toml":
+            try:
+                result = _check_toml_syntax_one(repo, relative_path)
+            except Exception:
+                result = None
+        elif suffix in {".sh", ".bash"}:
+            try:
+                result = _check_shell_syntax_one(repo, relative_path)
+            except Exception:
+                result = None
+        elif suffix == ".vue":
+            try:
+                result = _check_vue_sfc_one(repo, relative_path)
+            except Exception:
+                result = None
+        elif suffix == ".svelte":
+            try:
+                result = _check_svelte_sfc_one(repo, relative_path)
+            except Exception:
+                result = None
         elif suffix in _BRACE_BALANCE_SUFFIXES:
             result = _check_brace_balance_one(repo, relative_path)
         # Other suffixes: trust the model; the LLM judge catches gross errors.
         if result:
             errors.append(result)
+        # Per-file Python runtime smoke (best-effort, gated by py exec).
+        if suffix == ".py":
+            try:
+                rt = _check_python_runtime_one(repo, relative_path)
+                if rt:
+                    errors.append(rt)
+            except Exception:
+                pass
     errors.extend(_check_broken_references(repo, patch))
     errors.extend(_check_unfiltered_mutations(repo, patch))
     errors.extend(_check_unsafe_sort_keys(repo, patch))
@@ -6254,6 +6273,41 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
     errors.extend(_rust_unregistered_module(repo, patch))
     errors.extend(_robots_sitemap_wrong_route(patch))
     errors.extend(_dangerous_inner_html_script(repo, patch))
+    # --- Ported correctness detectors ---
+    for _detector_call in (
+        lambda: _detect_intra_scope_duplicate_decls(repo, patch),
+        lambda: _detect_removed_import_still_used(repo, patch),
+        lambda: _detect_self_overwrite_in_added(patch),
+        lambda: _detect_duplicate_ts_decl_in_repo(repo, patch),
+        lambda: _detect_phantom_imports(patch, repo),
+        lambda: _detect_duplicate_default_export(patch),
+        lambda: _detect_duplicate_default_export_in_repo(patch, repo),
+        lambda: _detect_react_namespace_without_import(patch),
+        lambda: _detect_react_hooks_stale_closure(patch),
+        lambda: _detect_hook_inside_iterator_callback(patch),
+        lambda: _detect_useeffect_missing_cleanup(patch),
+        lambda: _detect_useeffect_setstate_loop(patch),
+        lambda: _detect_nextjs_client_server_violation(patch),
+        lambda: _detect_rust_char_literal_misuse(patch),
+        lambda: _detect_nullable_inner_join_fk(patch, repo),
+        lambda: _detect_sql_unknown_columns(patch, repo),
+        lambda: _detect_unused_imports_in_new_files(patch),
+        lambda: _detect_unsolicited_return_block_deletion(patch),
+        lambda: _detect_binary_artifacts(patch),
+        lambda: _detect_off_convention_new_files(patch, repo),
+        lambda: _detect_package_json_deps_misplacement(patch),
+        lambda: _detect_removed_public_symbols_still_used(patch, repo),
+    ):
+        try:
+            errors.extend(_detector_call())
+        except Exception:
+            pass
+    # Duplicate-class-bodies returns (path, msg) tuples — flatten to strings.
+    try:
+        for _path, _msg in _detect_duplicate_class_bodies(patch):
+            errors.append(f"{_path}: {_msg}")
+    except Exception:
+        pass
     return errors
 
 
@@ -8297,6 +8351,24 @@ def _named_path_coverage_count(patch: str, issue_text: str) -> int:
         return 0
 
 
+def _specification_coverage_count(patch: str, issue_text: str) -> int:
+    """Tie-breaker: how many extracted acceptance criteria the patch's added
+    lines actually mention. Inverse of `_unaddressed_criteria`.
+
+    Returns 0 on issues with fewer than 2 criteria so single-item tasks are
+    untouched (pure no-op there). On multi-bullet tasks two candidates often
+    tie on reward and consensus; preferring the one with broader specification
+    coverage favours completeness over arbitrary length-based ordering."""
+    try:
+        criteria = _extract_acceptance_criteria(issue_text)
+        if len(criteria) < 2:
+            return 0
+        unaddressed = _unaddressed_criteria(patch, issue_text)
+        return max(0, len(criteria) - len(unaddressed))
+    except Exception:
+        return 0
+
+
 def _gps_prune_and_score(
     raw: List[Tuple[int, str]],
     issue_text: str,
@@ -8324,6 +8396,7 @@ def _gps_prune_and_score(
         )
     scored.sort(key=lambda c: (-c.reward, -c.consensus_votes,
                                -_named_path_coverage_count(c.patch, issue_text),
+                               -_specification_coverage_count(c.patch, issue_text),
                                len(c.patch)))
     return scored[:_GPS_SELECTOR_MAX_INPUT]
 
@@ -8424,6 +8497,7 @@ def _gps_selector_pick(
     pool = regress_pass if regress_pass else candidates
     pool = sorted(pool, key=lambda c: (-c.reward, -c.consensus_votes,
                                        -_named_path_coverage_count(c.patch, issue_text),
+                                       -_specification_coverage_count(c.patch, issue_text),
                                        len(c.patch)))
     dual_idx = _gps_selector_dual_verify(
         issue_text,
@@ -10480,6 +10554,12 @@ _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
 # failure mode observed in duel #4544). Keep outer budget under ~300s.
 _MULTISHOT_TOTAL_BUDGET = 278.0
 _MULTISHOT_MIN_ATTEMPT_RESERVE = 52.0
+_COVERAGE_CLOSURE_MIN_REMAINING = 40.0
+_COVERAGE_CLOSURE_TIMEOUT = 18
+_COVERAGE_CLOSURE_MAX_TOKENS = 1400
+_COVERAGE_CLOSURE_MIN_CRITERIA = 3
+_COVERAGE_CLOSURE_MAX_EDITS = 8
+_COVERAGE_CLOSURE_OUTER_WALL = 40.0
 # If attempt 1 already consumed this much wall clock, skip attempt 2 even when
 # attempt 1 was low-signal — otherwise the process often dies before the retry
 # finishes, which is worse than shipping the first (possibly thin) patch.
@@ -10532,6 +10612,212 @@ def _multishot_attempt_review_notes(
         except Exception:
             pass
     return notes
+
+
+def _coverage_closure_pass(
+    repo: Optional[Path],
+    initial_head: Optional[str],
+    winner_patch: str,
+    issue_text: str,
+    started_at: float,
+    inference_cfg: Tuple[Optional[str], Optional[str], Optional[str]],
+) -> Optional[str]:
+    """One targeted follow-up pass on the already-selected candidate.
+
+    Returns an augmented patch only when the augmentation provides STRUCTURAL
+    implementation evidence (new/changed function/method/class headers,
+    conditional branches, return/raise statements, route decorators, import
+    statements, or non-trivial assignments / call expressions) for at least
+    one unmet requirement, AND keeps all other signals flat or better.
+    Otherwise the worktree is reverted and None is returned.
+
+    NOTE: vocabulary presence in added lines is NOT sufficient on its own —
+    comments, docstrings, string constants reciting requirement phrases do not
+    count toward acceptance. The verification scans added lines for executable
+    code shapes before approving the augmentation.
+    """
+    if repo is None or not winner_patch.strip():
+        return None
+    phase_start = time.monotonic()
+    elapsed = phase_start - started_at
+    if (_MULTISHOT_TOTAL_BUDGET - elapsed) < _COVERAGE_CLOSURE_MIN_REMAINING:
+        return None
+    try:
+        all_criteria = _extract_acceptance_criteria(issue_text)
+    except Exception:
+        return None
+    if len(all_criteria) < _COVERAGE_CLOSURE_MIN_CRITERIA:
+        return None
+    try:
+        uncovered = _unaddressed_criteria(winner_patch, issue_text)
+    except Exception:
+        return None
+    if not uncovered:
+        return None
+    try:
+        explicit = _extract_explicit_targets(issue_text)
+    except Exception:
+        explicit = []
+    try:
+        touched = _patch_changed_files(winner_patch)[:5]
+        touched_set = set(_patch_changed_files(winner_patch))
+    except Exception:
+        touched = []
+        touched_set = set()
+    snippets: List[str] = []
+    for path in touched:
+        try:
+            snip = _read_context_file(repo, path, 2000)
+        except Exception:
+            snip = ""
+        if snip.strip():
+            snippets.append(f"### {path}\n```\n{snip}\n```")
+    bullets = "\n".join(f"- {c}" for c in uncovered[:_COVERAGE_CLOSURE_MAX_EDITS])
+    extras = "\n".join(f"- {e}" for e in explicit[:5]) if explicit else "(none)"
+    prompt = (
+        "Follow-up implementation pass. The current draft patch handles most "
+        "of the task but the following requirements still appear unimplemented:\n"
+        f"{bullets}\n\n"
+        f"Additional verbatim names that may need wiring:\n{extras}\n\n"
+        "For EACH bullet, implement the named behaviour by editing or adding "
+        "the actual code path that exercises it (function/method body, "
+        "conditional branch, return/raise statement, route handler, import "
+        "wiring, real assignment). Comments, docstrings, and string constants "
+        "alone do NOT count and will be rejected by the verifier. Do NOT "
+        "rewrite unrelated logic. Do NOT add features not named above. Prefer "
+        "editing files already changed by the draft patch. Emit only <edit> "
+        "blocks then <final>done</final>.\n\n"
+        f"TASK:\n{_truncate(issue_text, 1800)}\n\n"
+        + "\n\n".join(snippets)
+    )
+    model_name, base, key = inference_cfg
+    try:
+        response, _, _ = chat_completion(
+            messages=[
+                {"role": "system", "content": "Follow-up implementer. Output edits only."},
+                {"role": "user", "content": prompt},
+            ],
+            model=model_name or "",
+            api_base=base,
+            api_key=key,
+            max_tokens=_COVERAGE_CLOSURE_MAX_TOKENS,
+            timeout=_COVERAGE_CLOSURE_TIMEOUT,
+            max_retries=1,
+        )
+    except Exception:
+        return None
+    if (time.monotonic() - phase_start) > _COVERAGE_CLOSURE_OUTER_WALL:
+        return None
+    edits_applied = 0
+    try:
+        actions = extract_actions_in_order(response or "")
+    except Exception:
+        actions = []
+    for kind, value in actions:
+        if kind != "edit":
+            continue
+        if edits_applied >= _COVERAGE_CLOSURE_MAX_EDITS:
+            break
+        try:
+            execute_edit(value, repo)
+        except Exception:
+            pass
+        edits_applied += 1
+        if (time.monotonic() - phase_start) > _COVERAGE_CLOSURE_OUTER_WALL:
+            break
+    if edits_applied == 0:
+        return None
+    try:
+        augmented = get_patch(repo)
+    except Exception:
+        augmented = ""
+    accept = False
+    if augmented.strip() and _patch_well_formed(augmented):
+        try:
+            new_uncovered = len(_unaddressed_criteria(augmented, issue_text))
+            old_uncovered = len(uncovered)
+            new_blockers = len(_patch_ship_blockers(augmented, issue_text))
+            old_blockers = len(_patch_ship_blockers(winner_patch, issue_text))
+            syntax_bad = bool(_check_syntax(repo, augmented))
+
+            # Structural-evidence gate: scan the *delta* (lines added by the
+            # follow-up pass, beyond what the winner patch already added) for
+            # executable code shapes. Vocabulary-only edits (pure comments,
+            # docstrings, bare string constants) fail this gate.
+            winner_added_set = set(
+                ln for ln in winner_patch.splitlines()
+                if ln.startswith("+") and not ln.startswith("+++")
+            )
+            delta_added: List[str] = []
+            for ln in augmented.splitlines():
+                if ln.startswith("+") and not ln.startswith("+++"):
+                    if ln not in winner_added_set:
+                        delta_added.append(ln[1:])
+
+            def _structural_evidence(lines: List[str]) -> bool:
+                # Strip leading whitespace, ignore pure comment / blank lines,
+                # ignore lines that are only a string literal (docstring shard).
+                struct_pats = (
+                    re.compile(r"^\s*(def|class|async\s+def)\s+\w"),
+                    re.compile(r"^\s*(if|elif|else|for|while|try|except|finally|with|match|case)\b"),
+                    re.compile(r"^\s*(return|raise|yield|await)\b"),
+                    re.compile(r"^\s*(import|from)\s+\w"),
+                    re.compile(r"^\s*@[A-Za-z_]"),
+                    re.compile(r"^\s*\w[\w\.\[\]]*\s*\([^)]*\)"),
+                    re.compile(r"^\s*\w[\w\.\[\]]*\s*=\s*[^#'\"]"),
+                    # JS/TS/Go/Java/Rust common shapes
+                    re.compile(r"^\s*(function|const|let|var|fn|func|public|private|protected)\b"),
+                    re.compile(r"^\s*(throw|new)\b"),
+                    re.compile(r"^\s*\}|\s*\{$"),
+                )
+                for raw in lines:
+                    s = raw.rstrip()
+                    if not s.strip():
+                        continue
+                    stripped = s.lstrip()
+                    if stripped.startswith("#") or stripped.startswith("//"):
+                        continue
+                    # Pure string-literal line (docstring shard or constant only)
+                    if re.match(r'^\s*[rbuRBU]*(?:"""|\'\'\'|"|\')', stripped) and \
+                            not re.search(r"=\s*[rbuRBU]*(?:\"|')", s) and \
+                            "(" not in stripped:
+                        continue
+                    for pat in struct_pats:
+                        if pat.search(s):
+                            return True
+                return False
+
+            structural_ok = _structural_evidence(delta_added)
+
+            # Forbid drive-by new files: every file touched by the augmented
+            # patch must either be in the winner's changed-files set or be a
+            # legitimate extension of it (we keep it strict — no new files).
+            try:
+                augmented_files = set(_patch_changed_files(augmented))
+            except Exception:
+                augmented_files = set()
+            new_files = augmented_files - touched_set if touched_set else set()
+            no_drive_by = (not new_files)
+
+            # Strict net gain: require at least one fewer unmet requirement.
+            net_gain_ok = (old_uncovered - new_uncovered) >= 1
+
+            if (net_gain_ok
+                    and new_blockers <= old_blockers
+                    and not syntax_bad
+                    and structural_ok
+                    and no_drive_by):
+                accept = True
+        except Exception:
+            accept = False
+    if accept:
+        return augmented
+    try:
+        _multishot_revert(repo, initial_head)
+        _multishot_apply_patch(repo, winner_patch)
+    except Exception:
+        pass
+    return None
 
 
 def _multishot_capture_head(repo: Path) -> Optional[str]:
@@ -11282,7 +11568,15 @@ def _patch_has_probable_duplicate_function_decls(patch: str) -> bool:
 
 
 def _patch_has_probable_duplicate_imports(patch: str) -> bool:
-    """Cheap pre-scan: repeated normalized import on '+' lines in one file block."""
+    """Cheap pre-scan: repeated normalized import on '+' lines in one file block.
+
+    Two complementary signals:
+      (a) The same NORMALISED import statement added twice (verbatim repeat);
+      (b) The same JS/TS NAMED-IMPORT BINDING added twice from DIFFERENT
+          modules (e.g. `+import { X } from 'a'` and `+import { X } from 'b'`
+          in the same file) — TypeScript fails with `Cannot redeclare
+          block-scoped variable 'X'` before any runtime check.
+    """
     if not patch.strip() or "diff --git " not in patch:
         return False
     try:
@@ -11301,6 +11595,10 @@ def _patch_has_probable_duplicate_imports(patch: str) -> bool:
             else:
                 continue
             seen: set = set()
+            # Signal (b): track which JS/TS named-import bindings the patch
+            # adds; same binding from any two modules = redeclare error.
+            seen_bindings: set = set()
+            is_js_ts = path.endswith(_LINT_JS_TS_EXTS)
             for ln in block.splitlines():
                 m = pat.match(ln)
                 if not m:
@@ -11309,6 +11607,25 @@ def _patch_has_probable_duplicate_imports(patch: str) -> bool:
                 if norm in seen:
                     return True
                 seen.add(norm)
+                if is_js_ts:
+                    # Extract named-import binding identifiers (handles `as`).
+                    # `import { Foo, Bar as B } from 'mod'` -> {Foo, B}.
+                    bm = re.search(r"\{([^}]*)\}", norm)
+                    if bm:
+                        for raw in bm.group(1).split(","):
+                            name = raw.strip().split(" as ")[-1].strip()
+                            if name and re.match(r"^[A-Za-z_$][\w$]*$", name):
+                                if name in seen_bindings:
+                                    return True
+                                seen_bindings.add(name)
+                    # Default binding: `import X from '...'` or
+                    # `import X, { Y } from '...'`.
+                    dm = re.match(r"^import\s+(?:type\s+)?([A-Za-z_$][\w$]*)\s*[,\s]", norm)
+                    if dm:
+                        name = dm.group(1)
+                        if name in seen_bindings:
+                            return True
+                        seen_bindings.add(name)
         return False
     except Exception:
         return True
@@ -12496,6 +12813,35 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                         result["self_imports_dropped"] = True
                 except Exception:
                     pass
+                # --- Ported autofixes (silent correctness) ---
+                try:
+                    _m6 = _strip_binary_artifacts_from_patch(result["patch"])
+                    if _m6 != result["patch"] and _m6.strip():
+                        result["patch"] = _m6
+                        result["binary_artifacts_stripped"] = True
+                except Exception:
+                    pass
+                try:
+                    _m7 = _autofix_drop_unsolicited_return_deletion_hunks(result["patch"])
+                    if _m7 != result["patch"] and _m7.strip():
+                        result["patch"] = _m7
+                        result["return_deletion_hunks_dropped"] = True
+                except Exception:
+                    pass
+                try:
+                    _m8 = _autofix_rust_char_literal_strings(result["patch"])
+                    if _m8 != result["patch"] and _m8.strip():
+                        result["patch"] = _m8
+                        result["rust_char_literals_autofixed"] = True
+                except Exception:
+                    pass
+                try:
+                    _m9 = _autofix_inject_test_framework_imports(result["patch"], _multishot_repo_obj)
+                    if _m9 != result["patch"] and _m9.strip():
+                        result["patch"] = _m9
+                        result["test_framework_imports_injected"] = True
+                except Exception:
+                    pass
                 # Best-of salvage selector: under-produced winner on multi-
                 # file issue → swap to higher-coverage salvage candidate.
                 try:
@@ -12828,6 +13174,34 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         if _winner_patch and _multishot_repo_obj is not None:
             _multishot_apply_patch(_multishot_repo_obj, _winner_patch)
 
+        try:
+            _augmented_patch = _coverage_closure_pass(
+                _multishot_repo_obj,
+                _multishot_initial_head,
+                _winner_patch,
+                _issue_text,
+                _multishot_started,
+                (
+                    kwargs.get("model"),
+                    kwargs.get("api_base"),
+                    kwargs.get("api_key"),
+                ),
+            )
+            if _augmented_patch is not None:
+                _winner_patch = _augmented_patch
+                _winner_result["patch"] = _augmented_patch
+                _winner_result["coverage_closure_applied"] = True
+                try:
+                    _salvage_pool.append((
+                        "coverage_closure",
+                        _augmented_patch,
+                        _patch_duel_score(_augmented_patch, _issue_text),
+                    ))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         _winner_result["multishot_attempts"] = 3 if _result3 is not None else 2
         _winner_result["multishot_winner"] = _winner_label
         _winner_result["multishot_cluster_size"] = len(winner_cluster)
@@ -12993,7 +13367,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         Each gate fires at most once. Correctness gates (ground-truth or
         structural) run before the cosmetic final-review.
         """
-        nonlocal syntax_fix_turns_used, test_fix_turns_used, completeness_turns_used, final_review_turns_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used
+        nonlocal completeness_turns_used, final_review_turns_used, hail_mary_turns_used, total_refinement_turns_used, must_edit_after_gap, must_edit_patch, gap_edit_nudges_used
         patch = get_patch(repo)
 
         # === NEW (P1 #3): Adaptive refinement gating =========================
@@ -13280,6 +13654,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             + _format_failing_tests_section(_baseline_failing_tests)
             + build_initial_user_prompt(issue, repo_summary, preloaded_context)
         )
+        _repo_context_lines: List[str] = []
+        for _hint_fn in (
+            _detect_stack_summary,
+            _detect_stack_idioms,
+            _ecosystem_convention_hints,
+            _modern_package_version_hint,
+        ):
+            try:
+                _hint = _hint_fn(repo)
+            except Exception:
+                _hint = ""
+            if _hint and _hint.strip():
+                _repo_context_lines.append(_hint.strip())
+        if _repo_context_lines:
+            _initial_user_content += "\n\n" + "\n\n".join(_repo_context_lines)
         _acceptance_criteria = _extract_acceptance_criteria(issue)
         if _acceptance_criteria and not _format_acceptance_rubric(issue).strip():
             _criteria_lines = "\n".join(
@@ -13775,6 +14164,3515 @@ def _extract_observation_section(observation_lower: str, section: str) -> str:
 # LOCAL TESTING ONLY: The validator imports solve() directly. You may adjust the
 # CLI to make local experiments easier, but do not rely on CLI-only behavior for
 # validation.
+
+
+# =============================================================================
+# Ported from prior agent: extra detectors, syntax checks, autofixes, hints.
+# Inserted ahead of CLI entry. Wiring is done via patches to _check_syntax.
+# =============================================================================
+
+# --- additional ported constants ---
+_REQUIRED_CLASS_SUFFIXES = (
+    "Repository", "Service", "Controller", "Manager", "Handler", "Provider",
+    "Factory", "Listener", "Adapter", "Strategy", "Component", "Skeleton",
+    "EmptyState", "Modal", "Dialog", "Page", "Card", "Form", "Banner",
+    "Header", "Footer", "Sidebar", "Toolbar", "Resolver", "Mapper",
+    "Validator", "Serializer", "Middleware", "Guard", "Decorator",
+    "Pipeline", "Worker", "Job", "Task", "Hook", "Helper", "Util",
+    "Client", "Server", "Gateway", "Proxy", "Builder", "Parser",
+    "Renderer", "Reducer", "Selector", "Store", "Slice",
+)
+
+_REQUIRED_CLASS_NAME_RE = re.compile(
+    r"\b([A-Z][A-Za-z0-9]{2,40}(?:" + "|".join(_REQUIRED_CLASS_SUFFIXES) + r"))\b"
+)
+
+_DEFINITION_HEADERS_PY = (
+    "class ", "def ",
+)
+
+_DEFINITION_HEADERS_JS = (
+    "class ", "function ", "interface ", "type ", "enum ", "const ",
+    "let ", "var ", "export class ", "export function ", "export interface ",
+    "export type ", "export enum ", "export const ", "export default class ",
+    "export default function ",
+)
+
+_DEFINITION_HEADERS_OTHER = (
+    "class ", "interface ", "struct ", "enum ", "trait ", "type ",
+    "object ", "fun ", "func ", "fn ", "public class ", "public interface ",
+    "private class ", "abstract class ",
+)
+
+_REQUIRED_METHOD_RE = re.compile(r"`([a-z_][a-z_0-9]{2,40})\s*\(\s*\)`")
+
+_PUBLIC_DEF_RE_PY = re.compile(r"^\s*(?:async\s+)?def\s+([a-z_][a-z_0-9]*)\s*\(")
+
+_PUBLIC_DEF_RE_JS = re.compile(r"^\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+([a-z_$][\w$]*)\s*\(")
+
+
+_BINARY_ARTIFACT_DIRS = (
+    "__pycache__/", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/",
+    "node_modules/", "target/", "dist/", "build/", ".next/",
+    ".nuxt/", ".turbo/", ".vercel/", "coverage/", ".coverage/",
+    ".idea/", ".vscode/",
+)
+
+_BINARY_ARTIFACT_EXTS = (
+    ".pyc", ".pyo", ".pyd", ".class", ".jar", ".war", ".ear",
+    ".o", ".obj", ".a", ".so", ".dylib", ".dll", ".lib", ".exe",
+    ".bin", ".dump", ".dat", ".sqlite", ".sqlite3", ".db",
+    ".log", ".lock", ".pid", ".swp", ".swo",
+    ".DS_Store", ".dSYM",
+)
+
+_CLASS_BLOCK_RE = re.compile(
+    r"(?:export\s+)?(?:abstract\s+)?(?:class|interface)\s+(\w+)[^{]*\{",
+)
+
+# Consumed by _detect_stack_idioms (line ~17049) and _ecosystem_convention_hints (line ~16924).
+_FRAMEWORK_IDIOM_GUIDANCE: Dict[str, str] = {
+    "NestJS": (
+        "NestJS idioms: use constructor-injection for dependencies, `@Injectable()` on services. "
+        "Use the right exception type: `NotFoundException` for missing records, `BadRequestException` "
+        "for invalid input, `UnauthorizedException`/`ForbiddenException` for auth. "
+        "DTOs use class-validator decorators (`@IsString`, `@IsOptional`, `@IsUUID`, `@IsEnum`); "
+        "prefer `PartialType(CreateXxxDto)` over cloning an entire DTO. "
+        "Controllers route via `@Get/@Post/@Patch/@Delete`."
+    ),
+    "Next.js": (
+        "Next.js idioms: respect `'use client'` directive in client components; app router uses "
+        "`page.tsx`/`layout.tsx`/`route.ts`. Server components are async; client components run in browser. "
+        "API routes in `app/api/.../route.ts`. Prefer server actions for mutations when on app router."
+    ),
+    "React": (
+        "React idioms: follow Rules of Hooks (top-level only, only from React functions/custom hooks; "
+        "never conditionally). Prefer functional components. Use `useCallback`/`useMemo` only when "
+        "referentially-stable values are needed for deps. `useState` for local, `useReducer` for complex."
+    ),
+    "Vue": (
+        "Vue idioms: prefer Composition API (`<script setup>`) for new code. Reactive state via "
+        "`ref()`/`reactive()`. Don't destructure reactive objects (loses reactivity). Use `computed()` "
+        "for derived state."
+    ),
+    "Nuxt": (
+        "Nuxt idioms: pages auto-route from `pages/`; layouts in `layouts/`. Server API in `server/api/`. "
+        "Use `useFetch`/`useAsyncData` for SSR-safe data; `$fetch` on client only. Composables auto-imported."
+    ),
+    "Angular": (
+        "Angular idioms: use Dependency Injection via constructor. Services are `@Injectable({ providedIn: 'root' })`. "
+        "Components use `@Component({ selector, template, styles })`. RxJS observables for async; "
+        "always unsubscribe (`takeUntilDestroyed` or async pipe)."
+    ),
+    "Svelte": (
+        "Svelte idioms: state is reactive by `$:` (v3-4) or `$state()` (v5 runes). Use `{#each}` for lists, "
+        "`{#if}` for conditionals. Stores via `writable()/readable()`. Two-way binding with `bind:`."
+    ),
+    "Remix": (
+        "Remix idioms: routes export `loader` (GET) and `action` (mutation). Use `useLoaderData`/`useActionData`. "
+        "Forms with `<Form method=\"post\">` use the action; navigation triggers loaders."
+    ),
+    "Express": (
+        "Express idioms: middleware chain via `app.use`. Errors propagate via `next(err)`. "
+        "Use a centralized error-handling middleware. Validate body via middleware (express-validator/joi/zod)."
+    ),
+    "Fastify": (
+        "Fastify idioms: schema-validation via `schema` option on routes. Plugins via `fastify.register`. "
+        "Hooks: `onRequest`, `preHandler`, `onSend`. Use `reply.code(n).send(payload)`."
+    ),
+    "Django": (
+        "Django idioms: use the ORM via QuerySets (`.filter().exclude().annotate()`). Atomic updates with `F()` "
+        "expressions. Schema changes go through migrations (`makemigrations`/`migrate`). Class-based views "
+        "or DRF `ViewSet` for APIs. Place managers on the model class. Forms via ModelForm."
+    ),
+    "FastAPI": (
+        "FastAPI idioms: Pydantic models for request/response. `Depends()` for DI. Async endpoints when "
+        "using async DB. Use proper status codes via `status.HTTP_*`. Path/Query/Body annotations carry "
+        "validation. Background tasks via `BackgroundTasks`."
+    ),
+    "Flask": (
+        "Flask idioms: blueprints for grouped routes. `request.json`/`request.form` for inputs. "
+        "Return tuples `(data, status, headers)` or use `jsonify`. Use Flask-SQLAlchemy for ORM if present."
+    ),
+    "Starlette": (
+        "Starlette idioms: middleware via `Middleware(...)`. Routes via `Route('/path', endpoint, methods=)`. "
+        "Use `JSONResponse`/`PlainTextResponse`. Background tasks via `BackgroundTask`."
+    ),
+    "TypeORM": (
+        "TypeORM idioms: entities via `@Entity()` + column decorators (`@PrimaryGeneratedColumn`, `@Column`). "
+        "Relations: `@OneToMany`/`@ManyToOne` with `inverseSide`/`@JoinColumn`. Repositories via DI. "
+        "For nullable FKs, guard `if (entity.relationId)` before joining (INNER JOIN on NULL fails)."
+    ),
+    "Prisma": (
+        "Prisma idioms: schema in `schema.prisma`. Migrations via `prisma migrate`. Queries via the "
+        "generated client (`prisma.user.findUnique({ where })`). Use `select`/`include` to shape results; "
+        "transactions via `$transaction([...])`."
+    ),
+    "Mongoose": (
+        "Mongoose idioms: schemas via `new Schema({...})`. Models via `mongoose.model('Name', schema)`. "
+        "Use `findById`/`findOne`/`find().lean()` for reads. Hooks via `schema.pre('save', ...)`."
+    ),
+    "Sequelize": (
+        "Sequelize idioms: models via `sequelize.define` or `class extends Model`. Associations via "
+        "`hasMany`/`belongsTo`. Transactions with `sequelize.transaction(async (t) => ...)`."
+    ),
+    "ASP.NET Core": (
+        "ASP.NET Core idioms: controllers inherit `ControllerBase` with `[ApiController]` / `[Route]`. "
+        "DI via constructor injection (services registered in `Program.cs`). Query/Route params: order "
+        "matters for the OpenAPI schema and clients — follow the reference's parameter order exactly. "
+        "Use `IActionResult` returns (`Ok()`, `NotFound()`, `BadRequest()`, `NoContent()`). EF Core "
+        "configuration in `OnModelCreating`/`IEntityTypeConfiguration<T>` (e.g., `entity.Property(e => "
+        "e.X).IsRequired()`). Match casing exactly when normalizing identifier strings — assertions "
+        "are usually case-sensitive."
+    ),
+    "Entity Framework": (
+        "EF Core idioms: `DbContext` with `DbSet<T>` properties. Schema config in `OnModelCreating` "
+        "via `modelBuilder.Entity<T>()` — use `.IsRequired()`, `.HasMaxLength(n)`, `.HasIndex(...)`, "
+        "`.HasOne()/.WithMany()`. Use `Include()` / `ThenInclude()` for eager loading. Migrations via "
+        "`dotnet ef migrations add/update`. Async queries: `ToListAsync()`, `FirstOrDefaultAsync()`."
+    ),
+    "Spring Boot": (
+        "Spring Boot idioms: `@RestController` + `@RequestMapping`. DI via constructor (preferred) or "
+        "`@Autowired`. Exception handling via `@ControllerAdvice` + `@ExceptionHandler`. "
+        "Use `ResponseEntity<T>` for control over status. JPA repositories extend `JpaRepository`. "
+        "Validation: `@Valid` on request body + `@NotNull`/`@Size` etc. on DTO fields."
+    ),
+    "Rails": (
+        "Rails idioms: skinny controllers, fat models. Resources via `resources :foo` in routes. "
+        "Scopes for query reuse. Strong parameters via `params.require(:foo).permit(...)`. "
+        "Migrations via `rails generate migration`. Convention over configuration — match where existing "
+        "controllers/models live."
+    ),
+    "Laravel": (
+        "Laravel idioms: routes in `routes/web.php`/`routes/api.php`. Controllers in `app/Http/Controllers`. "
+        "Eloquent models extend `Model`. Form requests for validation (`php artisan make:request`). "
+        "Use `$request->validated()` after a FormRequest. Migrations via `database/migrations/`."
+    ),
+    "Tauri": (
+        "Tauri idioms: Rust backend in `src-tauri/src/`, exposed commands marked `#[tauri::command]` and "
+        "registered in `tauri::Builder::default().invoke_handler(tauri::generate_handler![...])`. "
+        "Frontend invokes via `import { invoke } from '@tauri-apps/api'`. Config in `tauri.conf.json`."
+    ),
+    "Electron": (
+        "Electron idioms: main process in `main.ts`/`main.js`, renderer in `renderer.ts`. IPC via "
+        "`ipcMain.handle` / `ipcRenderer.invoke`. Preload script bridges contexts via "
+        "`contextBridge.exposeInMainWorld`. Prefer context isolation + nodeIntegration:false."
+    ),
+    "SwiftUI": (
+        "SwiftUI idioms: Views are structs conforming to `View`. State via `@State`, "
+        "`@Binding`, `@ObservedObject`, `@StateObject`, `@EnvironmentObject`. Use `.task` for "
+        "async work, `.onAppear` for one-shot setup. Previews via `#Preview` (macros) or "
+        "`PreviewProvider` (legacy)."
+    ),
+    "Jetpack Compose": (
+        "Jetpack Compose idioms: composables are `@Composable fun` returning `Unit`. State via "
+        "`remember { mutableStateOf(...) }` or `rememberSaveable`. Side effects: `LaunchedEffect`, "
+        "`DisposableEffect`, `SideEffect`. Use `Modifier` chain for layout/styling, not separate properties."
+    ),
+    "Tailwind CSS": (
+        "Tailwind idioms: utility classes directly on elements; avoid `@apply` except in component layers. "
+        "Match the project's existing spacing/color scale exactly — `p-4` vs `p-3` etc. Custom colors "
+        "in `tailwind.config.js` `theme.extend`. Prefer logical-property utilities (`ms-/me-`) if used."
+    ),
+    "shadcn/ui": (
+        "shadcn/ui idioms: components are vendored into `components/ui/`, not installed via package. "
+        "Add new components with `npx shadcn-ui@latest add <name>`. Customize Tailwind theme via "
+        "`tailwind.config.js` + CSS variables in `globals.css`. Use the `cn()` helper for class merging."
+    ),
+    "MUI": (
+        "MUI (Material UI) idioms: theme via `createTheme` + `<ThemeProvider>`. Style with `sx` prop or "
+        "`styled(Component)`. Component variants via `theme.components.MuiX.styleOverrides`. Use system "
+        "props (`sx={{ m: 2, p: 1 }}`) instead of inline styles."
+    ),
+    "Supabase": (
+        "Supabase idioms: client via `createClient(url, anonKey)` from `@supabase/supabase-js`. "
+        "Single client instance reused across the app (don't create per-component). Use Row Level "
+        "Security; never bypass with service key client-side. Real-time via "
+        "`supabase.channel(...).on('postgres_changes', ...)`. Auth via `supabase.auth.getUser()`."
+    ),
+    "Firebase": (
+        "Firebase idioms: initialize once via `initializeApp(config)`. Modular SDK v9+ uses tree-shakable "
+        "imports (`import { getFirestore, doc, getDoc } from 'firebase/firestore'`). Avoid legacy compat "
+        "imports. Use `useDocument`/`useCollection` hooks if `react-firebase-hooks` is present."
+    ),
+    "Convex": (
+        "Convex idioms: queries/mutations/actions in `convex/` directory, exported via "
+        "`export const x = query({ args, handler })`. Frontend via `useQuery(api.foo.bar, args)`. "
+        "Schema in `convex/schema.ts` via `defineSchema(defineTable(...))`."
+    ),
+    "Astro": (
+        "Astro idioms: `.astro` files with frontmatter + template. Server-side by default; opt into "
+        "client interactivity via `client:load`/`client:visible`/`client:idle` directives. Routes in "
+        "`src/pages/`. Content collections via `defineCollection` in `src/content/config.ts`."
+    ),
+    "SolidJS": (
+        "SolidJS idioms: signals via `createSignal`, derivations via `createMemo`, side effects via "
+        "`createEffect`. Don't destructure props (loses reactivity); use `props.x` or `() => props.x`. "
+        "JSX-like but with `class=` not `className=`. `<For>`/`<Show>` over `.map`/`&&` for reactivity."
+    ),
+    "Bun": (
+        "Bun idioms: native test runner via `bun test` and `import { test, expect } from 'bun:test'`. "
+        "Built-in SQLite via `import { Database } from 'bun:sqlite'`. HTTP server via `Bun.serve({ fetch })`. "
+        "Bun.file/Bun.write for fast filesystem. Avoid Node-only APIs when Bun-native exists."
+    ),
+    "Deno": (
+        "Deno idioms: imports use full URLs or `deno.json` import maps. Permissions explicit "
+        "(`--allow-net`, `--allow-read`). Standard library at `https://deno.land/std/`. Tests via "
+        "`Deno.test('name', fn)`. Use Web standard APIs (`fetch`, `Response`, `URL`) over Node ones."
+    ),
+    "Drizzle": (
+        "Drizzle ORM idioms: schema as `.ts` files using `pgTable`/`mysqlTable`/`sqliteTable`. Migrations "
+        "via `drizzle-kit generate` + `drizzle-kit migrate`. Queries via the builder (`db.select().from(t).where(eq(...))`). "
+        "Relations via `relations(t, ({ one, many }) => ...)`."
+    ),
+    # Infra-as-code packs — when the repo already has a Dockerfile, compose
+    # file, railway/render/fly/vercel/netlify config, the model should edit
+    # it with the host's canonical schema rather than generic key/value pairs.
+    "Dockerfile": (
+        "Dockerfile idioms: pin a specific base tag (`python:3.11-slim` not `python:slim`). "
+        "Order layers by stability: system deps → language-runtime install → application code "
+        "(maximizes cache reuse). Use multi-stage builds for compiled apps; final stage runs as "
+        "non-root (`USER appuser`). Use `COPY requirements.txt .` then `RUN pip install -r requirements.txt` "
+        "BEFORE `COPY . .` so code changes don't invalidate the deps layer. Set `WORKDIR`. "
+        "Expose only the port the app actually listens on. Use `CMD` not `ENTRYPOINT` for the "
+        "default command when overrides should be easy."
+    ),
+    "docker-compose": (
+        "docker-compose idioms: top-level `services:` with one entry per container. Use "
+        "`build:` for local Dockerfiles or `image:` for registry images, not both. Use "
+        "`depends_on:` with `condition: service_healthy` when the upstream defines a healthcheck. "
+        "Persist data with named volumes under `volumes:`. Networks are auto-created; define "
+        "custom networks only when isolation is required. Use `environment:` blocks for env "
+        "vars, not `env_file:` unless secrets must stay out of git."
+    ),
+    "Railway": (
+        "Railway (railway.toml/railway.json) idioms: `[build] builder = \"DOCKERFILE\"` with "
+        "`dockerfilePath = \"./Dockerfile\"` when a Dockerfile exists, or `builder = \"NIXPACKS\"` "
+        "for managed buildpack flow. `[deploy] startCommand` overrides the Dockerfile CMD. "
+        "Set `healthcheckPath = \"/health\"` and `healthcheckTimeout = 100` for reliable rollouts. "
+        "Use `restartPolicyType = \"ON_FAILURE\"`. Env vars set via Railway dashboard, not in toml."
+    ),
+    "Render": (
+        "Render (render.yaml) idioms: `services:` list with `type: web` for HTTP services. "
+        "`env: docker` requires `dockerfilePath: ./Dockerfile`; `env: node`/`env: python` use "
+        "the language buildpack with `buildCommand` and `startCommand`. Set `plan: free` "
+        "or higher explicitly. Use `healthCheckPath: /health`. Postgres/Redis via "
+        "`databases:` block with `name` + `plan`. Reference deps via `fromService` or `fromDatabase`."
+    ),
+    "Fly.io": (
+        "Fly.io (fly.toml) idioms: top-level `app = \"name\"` and `primary_region = \"iad\"`. "
+        "`[build] dockerfile = \"Dockerfile\"` or `builder = \"paketobuildpacks/builder:base\"`. "
+        "`[http_service] internal_port = 8080, force_https = true, auto_stop_machines = true, "
+        "auto_start_machines = true, min_machines_running = 0`. Use `[[vm]] cpu_kind = \"shared\", "
+        "cpus = 1, memory_mb = 256`. Volumes via `[mounts] source, destination`."
+    ),
+    "Vercel": (
+        "Vercel (vercel.json) idioms: prefer file-based routing in `app/` (Next.js app router) "
+        "over explicit `routes`. When needed, use `rewrites` (preserve URL) over `redirects` "
+        "(change URL). `headers` array for security headers. Env vars via Vercel dashboard. "
+        "Serverless functions in `api/` with default Node runtime, or `edge` runtime via "
+        "`export const config = { runtime: 'edge' }`. Build settings auto-detect framework."
+    ),
+    "Netlify": (
+        "Netlify (netlify.toml) idioms: `[build]` block with `command = \"npm run build\"` and "
+        "`publish = \"dist\"` (or framework default). `[functions]` block sets `directory = "
+        "\"netlify/functions\"`. Use `[[redirects]]` with `from`/`to`/`status = 200` for SPA "
+        "fallback (`from = \"/*\"` to `to = \"/index.html\"`). `[[headers]]` for security/cache. "
+        "Plugins via `[[plugins]] package = \"@netlify/plugin-X\"`."
+    ),
+}
+
+_HOOK_BUILTIN_NAMES = frozenset({
+    "console", "window", "document", "Math", "Object", "Array", "String",
+    "Number", "Boolean", "JSON", "Promise", "Date", "Set", "Map", "WeakMap",
+    "WeakSet", "RegExp", "Error", "TypeError", "RangeError", "Symbol",
+    "fetch", "setTimeout", "setInterval", "clearTimeout", "clearInterval",
+    "requestAnimationFrame", "cancelAnimationFrame", "URL", "URLSearchParams",
+    "FormData", "Headers", "Response", "Request", "atob", "btoa",
+    "true", "false", "null", "undefined", "this", "return", "if", "else",
+    "for", "while", "do", "switch", "case", "default", "break", "continue",
+    "throw", "try", "catch", "finally", "new", "delete", "typeof", "instanceof",
+    "in", "of", "function", "const", "let", "var", "async", "await",
+    "void", "yield", "import", "export", "from", "as", "extends",
+    "React", "props", "args", "ref", "key", "id", "name", "value",
+    "data", "result", "response", "request", "params", "query", "body",
+    "type", "length", "size", "index", "i", "j", "k", "x", "y", "z",
+    "e", "ev", "evt", "event", "err", "error",
+})
+
+_HOOK_CALL_RE = re.compile(r"\b(use[A-Z]\w*)\s*\(")
+
+_HOOK_IDENT_RE = re.compile(r"\b([A-Za-z_]\w*)\b")
+
+_INTRA_CONST_RE = re.compile(r"^\s*(?:const|let)\s+([A-Za-z_$][\w$]*)\s*[:=]")
+
+_ITERATOR_CB_RE = re.compile(
+    r"\.\s*(map|filter|forEach|reduce|some|every|find|findIndex|flatMap|sort)\s*\(\s*"
+    r"(?:async\s+)?(?:\([^)]*\)|\w+)\s*=>"
+)
+
+_JEST_MARKERS = (
+    "jest.fn", "jest.mock", "jest.spyOn", "jest.useFakeTimers",
+    "from '@jest/globals'", 'from "@jest/globals"',
+)
+
+_JS_CONST_DECL_RE = re.compile(
+    r"^\s*(?:export\s+)?(?:const|let)\s+([A-Za-z_$][\w$]*)\s*[:=]"
+)
+
+_JS_FUNC_HEADER_RE = re.compile(
+    r"^\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)|"
+    r"^\s*(?:export\s+(?:default\s+)?)?const\s+([A-Za-z_$][\w$]*)\s*[:=]\s*(?:async\s+)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>|"
+    r"^\s*(?:export\s+(?:default\s+)?)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)"
+)
+
+_JS_IMPORT_DEFAULT_RE = re.compile(r"^\s*import\s+(\w+)\s+from\s+['\"][^'\"]+['\"]")
+
+_JS_IMPORT_NAMED_RE = re.compile(
+    r"import\s*\{\s*([^}]+)\s*\}\s*from\s*['\"]([^'\"]+)['\"]"
+)
+
+_JS_IMPORT_NAMESPACE_RE = re.compile(r"^\s*import\s+\*\s+as\s+(\w+)\s+from\s+['\"][^'\"]+['\"]")
+
+_JS_LIKE_EXTS = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
+
+_JS_REL_IMPORT_RE = re.compile(
+    r"(?:from|import|require)\s*\(?\s*['\"]((?:\./|\.\./)[^'\"]+)['\"]"
+)
+
+_JS_TS_FILE_SUFFIXES = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte")
+
+_NEW_FILE_HEADER_RE = re.compile(r"^new file mode\b", re.MULTILINE)
+
+_PKG_DEV_ONLY_TOOLS = frozenset({
+    "eslint", "prettier", "jest", "vitest", "mocha", "chai", "ava",
+    "@testing-library/react", "@testing-library/vue",
+    "@types/node", "@types/react", "@types/react-dom",
+    "ts-node", "nodemon", "rollup", "esbuild",
+    "husky", "lint-staged",
+})
+
+_PKG_RUNTIME_BUILD_TOOLS = frozenset({
+    "tailwindcss", "@tailwindcss/postcss", "@tailwindcss/vite",
+    "postcss", "autoprefixer",
+    "vite", "@vitejs/plugin-react", "@vitejs/plugin-vue",
+    "next", "react", "react-dom", "vue", "@vue/runtime-dom",
+    "express", "fastify", "hono", "koa",
+    "typescript",  # next/tsx build-on-server needs it
+})
+
+_PY_IMPORT_FROM_RE = re.compile(r"^\s*from\s+([\w\.]+)\s+import\s+", re.MULTILINE)
+
+_PY_IMPORT_RE = re.compile(r"^\s*import\s+([\w\.]+)(?:\s+as\s+\w+)?\s*(?:#.*)?$", re.MULTILINE)
+
+_PY_THIRD_PARTY_ROOTS = {
+    "abc", "anyio", "asyncio", "attr", "attrs", "boto3", "botocore", "celery",
+    "click", "collections", "concurrent", "contextlib", "copy", "csv", "ctypes",
+    "dataclasses", "datetime", "decimal", "dis", "django", "doctest", "email",
+    "enum", "fastapi", "flask", "functools", "glob", "gzip", "hashlib", "hmac",
+    "html", "http", "importlib", "inspect", "io", "ipaddress", "itertools", "json",
+    "logging", "math", "mimetypes", "multiprocessing", "numpy", "openai", "os",
+    "pandas", "pathlib", "pickle", "pkg_resources", "platform", "pluggy",
+    "pprint", "psutil", "pydantic", "pytest", "pytz", "queue", "random", "re",
+    "redis", "requests", "rest_framework", "scipy", "secrets", "select",
+    "shutil", "signal", "six", "socket", "sqlalchemy", "sqlite3", "ssl", "stat",
+    "starlette", "string", "struct", "subprocess", "sys", "tempfile", "tenacity",
+    "tensorflow", "threading", "time", "tomllib", "torch", "traceback", "typer",
+    "types", "typing", "unittest", "urllib", "uuid", "warnings", "weakref",
+    "yaml", "zipfile", "zlib", "anthropic", "openai", "sklearn", "matplotlib",
+    "seaborn", "plotly", "transformers",
+}
+
+_PY_USAGE_TOKEN_RE = re.compile(r"\b([A-Za-z_]\w*)\b")
+
+_REACT_HOOK_DEP_RE = re.compile(
+    r"\b(useCallback|useMemo|useEffect|useLayoutEffect)\s*\("
+    r"(?:\s*\(\s*[^)]*\)\s*=>\s*\{|\s*async\s*\(\s*[^)]*\)\s*=>\s*\{)"
+    r"(.*?)"
+    r"\}\s*,\s*\[\s*([^\]]*)\s*\]\s*\)",
+    re.DOTALL,
+)
+
+_REACT_HOOK_NODEPS_RE = re.compile(
+    r"\b(useEffect|useLayoutEffect)\s*\(\s*\(\s*\)\s*=>\s*\{"
+    r"(.*?)"
+    r"\}\s*\)\s*[;}]",
+    re.DOTALL,
+)
+
+_REACT_IMPORT_RE = re.compile(
+    r"""^\s*import\s+(?:React|\*\s+as\s+React)\s+from\s+['"]react['"]""",
+    re.MULTILINE,
+)
+
+_REACT_NS_USE_RE = re.compile(r"\bReact\.([A-Z]\w+)\b")
+
+_REMOVED_IMPORT_DEFAULT_RE = re.compile(
+    r"^\s*import\s+(?:type\s+)?([A-Za-z_$][\w$]*)\s+from\s+['\"]([^'\"]+)['\"]"
+)
+
+_REMOVED_IMPORT_NAMED_RE = re.compile(
+    r"^\s*import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+['\"]([^'\"]+)['\"]"
+)
+
+_RUST_BAD_CHAR_LIT_LINE_RE = re.compile(r"'([A-Za-z][A-Za-z0-9_]+)'")
+
+_RUST_CHAR_LIT_RE = re.compile(r"'([A-Za-z][A-Za-z0-9_]+)'")
+
+_SELF_OVERWRITE_NEAR_LINES = 8
+
+_SQL_COL_STOPWORDS = {
+    "length", "count", "value", "values", "name", "type", "size", "data",
+    "result", "results", "items", "item", "list", "params", "options",
+    "config", "settings", "context", "request", "response", "body",
+    "json", "text", "string", "number", "boolean", "object", "array",
+    "props", "state", "field", "fields", "format", "method", "path",
+    "test", "tests", "spec", "specs", "default", "version", "status",
+}
+
+_SQL_KEYWORD_RE = re.compile(
+    r"\b(?:SELECT|FROM|JOIN|WHERE|UPDATE|INSERT\s+INTO|DELETE\s+FROM|GROUP\s+BY|ORDER\s+BY|HAVING|UNION)\b",
+    re.IGNORECASE,
+)
+
+_SQL_QUALIFIED_COL_RE = re.compile(r"\b([a-zA-Z_]\w*)\.([a-zA-Z_][a-zA-Z0-9_]{3,})\b")
+
+_TEST_FILE_RE = re.compile(r"\.(?:test|spec)\.(?:ts|tsx|js|jsx|mjs|cjs)$")
+
+_TEST_GLOBAL_USE_RE = re.compile(
+    r"\b(?:describe|it|test|expect|beforeEach|afterEach|beforeAll|afterAll|vi|vitest)\s*\("
+)
+
+_TEST_IMPORT_PRESENT_RE = re.compile(
+    r"^\s*import\s*\{[^}]*\b(?:describe|it|test|expect)\b[^}]*\}\s*from\s*['\"](?:vitest|@jest/globals)['\"]",
+    re.MULTILINE,
+)
+
+_TS_INTERFACE_DECL_RE = re.compile(
+    r"^\s*(?:export\s+)?interface\s+([A-Za-z_$][\w$]*)\b"
+)
+
+_USE_REF_HOOK_RE = re.compile(r"^\s*const\s+([A-Za-z_$][\w$]*)\s*=\s*useRef\b")
+
+_USE_STATE_HOOK_RE = re.compile(r"^\s*const\s+\[\s*([A-Za-z_$][\w$]*)\s*,\s*set([A-Z][\w$]*)\s*\]\s*=\s*useState\b")
+
+_VITEST_MARKERS = (
+    "import { vi", "vi.fn", "vi.mock", "vi.spyOn", "vi.useFakeTimers",
+    "from 'vitest'", 'from "vitest"',
+)
+
+
+
+def _sample_text(
+    repo: Path,
+    globs: Tuple[str, ...],
+    *,
+    max_files: int = 10,
+    max_bytes_per_file: int = 30000,
+) -> str:
+    """Concatenate text from up to `max_files` matching tracked source files,
+    capped to `max_bytes_per_file` each. Returns "" on any error. Used by
+    convention-hint gates to inspect existing project style before nudging
+    the model toward a specific convention.
+    """
+    if repo is None or not globs:
+        return ""
+    chunks: List[str] = []
+    seen = 0
+    try:
+        for pat in globs:
+            for path in repo.rglob(pat):
+                if seen >= max_files:
+                    break
+                try:
+                    rel = path.relative_to(repo)
+                except Exception:
+                    continue
+                # Skip vendor / node_modules / build outputs
+                low = str(rel).lower()
+                if any(skip in low for skip in (
+                    "node_modules/", "/vendor/", "/dist/", "/build/", "/.next/",
+                    "/out/", "/coverage/", "/__pycache__/",
+                )):
+                    continue
+                try:
+                    data = path.read_bytes()[:max_bytes_per_file]
+                except Exception:
+                    continue
+                if b"\0" in data[:1024]:
+                    continue
+                chunks.append(data.decode("utf-8", errors="replace"))
+                seen += 1
+            if seen >= max_files:
+                break
+    except Exception:
+        return ""
+    return "\n".join(chunks)
+
+
+def _detect_unsolicited_return_block_deletion(patch: str) -> List[str]:
+    """Catch hunks that REMOVE a JS/TS `return (...)` block without adding a
+    replacement return. The function declaration is still present in context
+    lines (the hunk is INSIDE an unchanged function), but its body is now
+    gone — the function silently returns undefined at runtime.
+
+    The Section.tsx failure shape (bench-20260601-143220-2): hunk strips
+    `-  return (` + JSX body + `-  );` while adding only `+` (a blank line).
+    The function signature is in `+/ ` context lines but its return is gone.
+
+    Conservative gate (avoids false positives on legitimate refactors that
+    rewrite the return shape):
+      - file suffix is JS/TS-family
+      - hunk contains a `-` line matching ``return\\s*\\(``
+      - hunk contains NO `+` line with a meaningful `return\b` statement
+        (so a refactor that replaces `return (...)` with `return foo()` is
+        NOT flagged)
+      - hunk's added body is essentially empty (≤1 substantive line)
+    Returns the list of affected file paths (capped at 4).
+    """
+    if not patch.strip() or "diff --git " not in patch:
+        return []
+    findings: List[str] = []
+    blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+    return_open_re = re.compile(r"^\s*return\s*\(\s*$")
+    return_any_re = re.compile(r"^\s*return\b")
+    for block in blocks:
+        if not block.startswith("diff --git "):
+            continue
+        m = re.match(r"^diff --git a/(.+?) b/(.+?)$", block.split("\n", 1)[0])
+        if not m:
+            continue
+        path = m.group(2)
+        if not path.endswith(_JS_TS_FILE_SUFFIXES):
+            continue
+        # Walk hunks
+        hunks = re.split(r"(?=^@@ )", block, flags=re.MULTILINE)
+        for hunk in hunks[1:]:
+            removed: List[str] = []
+            added: List[str] = []
+            for ln in hunk.splitlines()[1:]:
+                if ln.startswith("-") and not ln.startswith("---"):
+                    removed.append(ln[1:])
+                elif ln.startswith("+") and not ln.startswith("+++"):
+                    added.append(ln[1:])
+            if not any(return_open_re.match(r) for r in removed):
+                continue
+            if any(return_any_re.search(a) for a in added):
+                continue
+            added_substantive = sum(1 for a in added if a.strip())
+            if added_substantive > 1:
+                continue
+            findings.append(
+                f"unsolicited_return_block_deletion:{path} — hunk removed a "
+                "`return (...)` block without adding a replacement return; "
+                "the function would now return undefined at runtime"
+            )
+            if len(findings) >= 4:
+                return findings
+            break
+    return findings[:4]
+
+
+def _detect_duplicate_ts_decl_in_repo(repo: Path, patch: str) -> List[str]:
+    """Targets the TypeScript compile error class where the post-patch file ends
+    up with TWO declarations of the same `interface Name` or `const Name`
+    (e.g. patch ADDS a new interface that already exists in the file, or
+    duplicates a const declaration). Both forms are immediate TS errors:
+    'Duplicate identifier' / 'Cannot redeclare block-scoped variable'.
+
+    Uses the post-patch file content (not just the patch context) so it
+    catches the case where the pre-existing declaration is many lines away
+    from the patched region.
+    """
+    if repo is None or not patch.strip():
+        return []
+    findings: List[str] = []
+    try:
+        repo_resolved = repo.resolve()
+        for rel in _patch_changed_files(patch):
+            if len(findings) >= 3:
+                break
+            if not rel.endswith(_JS_TS_FILE_SUFFIXES):
+                continue
+            full = (repo / rel).resolve()
+            try:
+                full.relative_to(repo_resolved)
+            except (ValueError, RuntimeError):
+                continue
+            if not full.is_file():
+                continue
+            source = _br_safe_read(full)
+            if source is None:
+                continue
+            counts: Dict[Tuple[str, str], int] = {}
+            for line in source.splitlines():
+                m = _TS_INTERFACE_DECL_RE.match(line)
+                if m:
+                    key = ("interface", m.group(1))
+                    counts[key] = counts.get(key, 0) + 1
+                    continue
+                m2 = _JS_CONST_DECL_RE.match(line)
+                if m2:
+                    key = ("const/let", m2.group(1))
+                    counts[key] = counts.get(key, 0) + 1
+            seen: set = set()
+            for (kind, name), n in counts.items():
+                if n < 2:
+                    continue
+                if (rel, kind, name) in seen:
+                    continue
+                seen.add((rel, kind, name))
+                findings.append(
+                    f"duplicate_decl:{rel}: `{kind} {name}` is declared {n} times "
+                    "in the post-patch file — TS rejects duplicate identifiers; "
+                    "remove the redundant declaration"
+                )
+                if len(findings) >= 3:
+                    break
+    except Exception:
+        return findings[:3]
+    return findings[:3]
+
+
+def _detect_intra_scope_duplicate_decls(repo: Path, patch: str) -> List[str]:
+    """Catch a recurring code-merge artifact where two declarations of the same
+    name end up in the same function scope, causing a const-redeclaration
+    runtime crash. Stems from multishot candidate splicing producing duplicate
+    useState blocks.
+
+    Different from `_detect_duplicate_ts_decl_in_repo` (which works at file
+    scope): this one walks function-by-function and finds duplicates within
+    each scope.
+
+    Conservative: indentation-based scope tracking (no full parser), so
+    flags only the cases where two declarations sit at the same indent level
+    inside the same outer function header. JS/TS only.
+    """
+    if repo is None or not patch.strip():
+        return []
+    findings: List[str] = []
+    _LOOP_COUNTER_SKIP = {
+        "i", "j", "k", "idx", "index", "item", "el", "key", "x", "y", "val", "value",
+    }
+    try:
+        added_by_file = _patch_added_lines_by_file(patch)
+        repo_resolved = repo.resolve()
+        for rel in _patch_changed_files(patch):
+            if len(findings) >= 4:
+                break
+            if not rel.endswith(_JS_TS_FILE_SUFFIXES):
+                continue
+            full = (repo / rel).resolve()
+            try:
+                full.relative_to(repo_resolved)
+            except (ValueError, RuntimeError):
+                continue
+            if not full.is_file():
+                continue
+            source = _br_safe_read(full)
+            if source is None:
+                continue
+            lines = source.splitlines()
+            # Build a set of added-line texts for this file so we can require
+            # at least one of the duplicates was introduced by this patch.
+            added_lines_set = set()
+            for raw in added_by_file.get(rel, []):
+                added_lines_set.add(raw.rstrip("\n"))
+            # Walk lines using brace-depth tracking (instead of indentation) so
+            # nested closures don't leak. Declarations are recorded only at
+            # depth == 1 (the body of a top-level function). per_scope resets
+            # when depth returns to 0.
+            current_scope: str = "<module>"
+            per_scope: Dict[str, Dict[Tuple[str, str], List[bool]]] = {}
+            depth = 0
+            in_template = False  # toggles on unmatched backtick parity per line
+            for line in lines:
+                # Count backticks not preceded by a backslash to update
+                # multi-line template literal state.
+                bt = len(re.findall(r"(?<!\\)`", line))
+                # If currently inside a template literal, skip declaration
+                # parsing for this line entirely (still update flag/depth).
+                line_in_template = in_template
+                if bt % 2 == 1:
+                    in_template = not in_template
+                if line_in_template:
+                    continue
+                stripped = line.lstrip()
+                indent = len(line) - len(stripped)
+                # Update brace depth using a string/comment-stripped copy so
+                # braces inside string literals or // comments are ignored.
+                code = re.sub(r"//[^\n]*", "", line)
+                code = re.sub(r'"(?:\\.|[^"\\])*"', '""', code)
+                code = re.sub(r"'(?:\\.|[^'\\])*'", "''", code)
+                code = re.sub(r"`(?:\\.|[^`\\])*`", "``", code)
+                opens = code.count("{")
+                closes = code.count("}")
+                # New top-level function header at indent 0 (and depth 0)
+                # opens a new scope.
+                if depth == 0 and indent == 0 and _JS_FUNC_HEADER_RE.match(line):
+                    m = _JS_FUNC_HEADER_RE.match(line)
+                    if m:
+                        name = m.group(1) or m.group(2) or m.group(3) or "<anon>"
+                        current_scope = f"{rel}::{name}"
+                        per_scope.setdefault(current_scope, {})
+                # Record declarations only when at the top of a function body
+                # (depth == 1 — i.e. the brace was opened on a function header
+                # and we're inside it but not inside any nested block).
+                if depth == 1:
+                    is_added = line in added_lines_set
+                    m = _USE_STATE_HOOK_RE.match(line)
+                    if m:
+                        var_name = m.group(1)
+                        per_scope.setdefault(current_scope, {}).setdefault(
+                            ("useState", var_name), []
+                        ).append(is_added)
+                    else:
+                        m = _USE_REF_HOOK_RE.match(line)
+                        if m:
+                            var_name = m.group(1)
+                            per_scope.setdefault(current_scope, {}).setdefault(
+                                ("useRef", var_name), []
+                            ).append(is_added)
+                        else:
+                            m = _INTRA_CONST_RE.match(line)
+                            if m:
+                                var_name = m.group(1)
+                                if var_name not in _LOOP_COUNTER_SKIP:
+                                    per_scope.setdefault(current_scope, {}).setdefault(
+                                        ("const", var_name), []
+                                    ).append(is_added)
+                # Update depth AFTER processing this line.
+                depth += opens - closes
+                if depth < 0:
+                    depth = 0
+                if depth == 0:
+                    # Returning to module scope: reset.
+                    per_scope.setdefault("<module>", {})
+                    current_scope = "<module>"
+            # Report duplicates — only when at least one declaration was on a
+            # `+` (added) line, otherwise the duplication pre-existed and is
+            # not this patch's fault.
+            for scope, names in per_scope.items():
+                for (kind, name), flags in names.items():
+                    if len(flags) < 2:
+                        continue
+                    if not any(flags):
+                        continue
+                    findings.append(
+                        f"intra_scope_duplicate:{rel}: `{kind} {name}` declared "
+                        f"{len(flags)} times in scope `{scope.split('::', 1)[-1]}` — "
+                        "const-redeclaration crash at runtime; remove the redundant block"
+                    )
+                    if len(findings) >= 4:
+                        return findings[:4]
+    except Exception:
+        return findings[:4]
+    return findings[:4]
+
+
+def _detect_removed_import_still_used(repo: Path, patch: str) -> List[str]:
+    """Catch the specific class of bug where the patch REMOVED an `import { X
+    } from '...'` line but `X` is still referenced in the post-patch file —
+    a hard TS/JS compile error.
+
+    Sister to `_removed_symbol_still_referenced_js_ts` (which checks removed
+    `const`/`function`/`class` declarations). This one checks REMOVED IMPORTS
+    specifically. Conservative gating mirrors the sibling:
+      - file suffix is JS/TS-family
+      - imported name occurs ≥1 time in post-patch source
+      - patch did NOT also re-add the same name on a `+` import line
+      - ≤3 findings to bound noise
+
+    Observed in real runs as a recurring compile-error gap:
+    'removes toast import but toast still used in the file' — the kind of
+    bug shipped when no detector catches the dangling reference.
+    """
+    if repo is None or not patch.strip() or "diff --git " not in patch:
+        return []
+    findings: List[str] = []
+    try:
+        added_by_file = _patch_added_lines_by_file(patch)
+        removed_by_file = _patch_removed_lines_by_file(patch)
+        repo_resolved = repo.resolve()
+        for rel in _patch_changed_files(patch):
+            if len(findings) >= 3:
+                break
+            if not rel.endswith(_JS_TS_FILE_SUFFIXES):
+                continue
+            full = (repo / rel).resolve()
+            try:
+                full.relative_to(repo_resolved)
+            except (ValueError, RuntimeError):
+                continue
+            if not full.is_file():
+                continue
+            source = _br_safe_read(full)
+            if source is None:
+                continue
+            added_blob = "".join(added_by_file.get(rel, []))
+            seen: set = set()
+            for raw in removed_by_file.get(rel, []):
+                stripped = raw.lstrip()
+                names: List[str] = []
+                m = _REMOVED_IMPORT_NAMED_RE.match(stripped)
+                if m:
+                    for part in m.group(1).split(","):
+                        local = part.strip().split(" as ")[-1].strip()
+                        # Strip TS `type Foo` / `typeof Foo` named-import prefixes
+                        local = re.sub(r"^(?:type|typeof)\s+", "", local).strip()
+                        if local and re.match(r"^[A-Za-z_$][\w$]*$", local):
+                            names.append(local)
+                else:
+                    m2 = _REMOVED_IMPORT_DEFAULT_RE.match(stripped)
+                    if m2:
+                        names.append(m2.group(1))
+                for name in names:
+                    if name in seen or len(name) < 2:
+                        continue
+                    seen.add(name)
+                    # Skip if patch re-adds the same name on an added import line.
+                    # NOTE: added_blob has `+` markers stripped, so match without leading `+`.
+                    if re.search(
+                        r"^\s*import\b[^\n]*\b" + re.escape(name) + r"\b",
+                        added_blob, re.MULTILINE,
+                    ):
+                        continue
+                    # Skip if post-patch file locally declares the same name
+                    # (function/class/const/let/var/type/interface/enum) — no
+                    # longer needs the import.
+                    if re.search(
+                        r"(?:^|\n)\s*(?:export\s+(?:default\s+)?)?"
+                        r"(?:function|class|const|let|var|type|interface|enum)\s+"
+                        + re.escape(name) + r"\b",
+                        source,
+                    ):
+                        continue
+                    # Strip comments/strings from source before counting to
+                    # avoid false positives from string/comment occurrences.
+                    cleaned = re.sub(r"//[^\n]*", "", source)
+                    cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL)
+                    cleaned = re.sub(r'"(?:\\.|[^"\\])*"', '""', cleaned)
+                    cleaned = re.sub(r"'(?:\\.|[^'\\])*'", "''", cleaned)
+                    cleaned = re.sub(r"`(?:\\.|[^`\\])*`", "``", cleaned)
+                    # Count post-patch occurrences (declaration's import line was removed).
+                    occ = len(re.findall(r"(?<![\w$])" + re.escape(name) + r"(?![\w$])", cleaned))
+                    if occ >= 1:
+                        findings.append(
+                            f"removed_import_still_used:{rel}: removed import `{name}` is "
+                            f"still referenced in the post-patch file (occurs {occ}x) — "
+                            "the file will fail to compile; restore the import or remove "
+                            "the remaining references"
+                        )
+                    if len(findings) >= 3:
+                        return findings[:3]
+    except Exception:
+        return findings[:3]
+    return findings[:3]
+
+
+def _detect_self_overwrite_in_added(patch: str) -> List[str]:
+    """Catch the self-defeating-assignment pattern: patch adds two assignments
+    `X = A` then `X = B` close together where the second is a generic/older
+    form (e.g. literal, identifier without prefix). The user code reassigns
+    X to a useless value right after setting it correctly. Seen in 4 tasks
+    across 6070-6083 — `user_message = formatted_message; user_message =
+    original_old_value`.
+
+    Conservative: only fires on ADDED lines (`+`), only when both assignments
+    are within `_SELF_OVERWRITE_NEAR_LINES` of each other, only for simple
+    `name = value` shapes, and only when the second RHS is shorter than the
+    first (heuristic for "reverted to older value"). At most 3 findings.
+    """
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    assign_re = re.compile(r"^(\s*)([A-Za-z_$][\w$]*)\s*=\s*(.+?)\s*;?\s*$")
+    ident_only_re = re.compile(r"^[A-Za-z_$][\w$]*$")
+    blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+    for block in blocks:
+        if not block.startswith("diff --git "):
+            continue
+        m = re.match(r"^diff --git a/(.+?) b/(.+?)$", block.split("\n", 1)[0])
+        if not m:
+            continue
+        path = m.group(2)
+        if not (path.endswith(_JS_TS_FILE_SUFFIXES) or path.endswith(".py")):
+            continue
+        # Collect added lines (in order, with their hunk position)
+        added: List[Tuple[int, str]] = []
+        line_no = 0
+        for raw in block.splitlines():
+            if raw.startswith("@@"):
+                hm = re.search(r"\+(\d+)", raw)
+                if hm:
+                    line_no = int(hm.group(1)) - 1
+                continue
+            if raw.startswith("+") and not raw.startswith("+++"):
+                line_no += 1
+                added.append((line_no, raw[1:]))
+            elif raw.startswith(" "):
+                line_no += 1
+        # Walk pairs of nearby assignments to same name
+        seen: set = set()
+        for i, (ln1, body1) in enumerate(added):
+            am1 = assign_re.match(body1)
+            if not am1:
+                continue
+            indent1, name1, rhs1 = am1.group(1), am1.group(2), am1.group(3)
+            for j in range(i + 1, min(i + _SELF_OVERWRITE_NEAR_LINES + 1, len(added))):
+                ln2, body2 = added[j]
+                if ln2 - ln1 > _SELF_OVERWRITE_NEAR_LINES:
+                    break
+                am2 = assign_re.match(body2)
+                if not am2:
+                    continue
+                indent2, name2, rhs2 = am2.group(1), am2.group(2), am2.group(3)
+                if name2 != name1:
+                    continue
+                # Require both at SAME indentation (different indent = nested
+                # scope / branch, not a sequential overwrite).
+                if indent1 != indent2:
+                    continue
+                # Skip when name1 appears anywhere in rhs2 (e.g.
+                # `result = transform(result)` / `total = total + d`) —
+                # that's a legitimate self-referential update, not an overwrite.
+                if re.search(r"\b" + re.escape(name1) + r"\b", rhs2):
+                    continue
+                # Skip simple identifier-only aliases on BOTH sides
+                # (e.g. `x = a` then `x = b`) — true rename/alias.
+                # Do NOT skip when only rhs2 is bare while rhs1 is a rich
+                # computed value — that is the overwrite pattern we catch.
+                if ident_only_re.match(rhs1.strip()) and ident_only_re.match(rhs2.strip()):
+                    continue
+                # Heuristic: second RHS is shorter (≤60% of first) AND first
+                # RHS is non-trivial (≥12 chars) — indicates "computed value
+                # overwritten by generic/older form".
+                if len(rhs1) >= 12 and len(rhs2) <= len(rhs1) * 0.6:
+                    key = (path, name1, ln1)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    findings.append(
+                        f"self_overwrite:{path}: `{name1}` reassigned to a shorter "
+                        f"value {ln2 - ln1} lines after being set to a richer "
+                        "expression — the second assignment likely overwrites the "
+                        "intended computed value with a default/literal"
+                    )
+                    if len(findings) >= 3:
+                        return findings[:3]
+                    break
+    return findings[:3]
+
+
+
+
+def _detect_phantom_imports(patch: str, repo: Optional[Path]) -> List[str]:
+    """Find imports added by the patch that resolve to NO file — neither in
+    the existing tracked files nor in the files the patch itself creates.
+
+    Targets the dominant under-production failure: a patch modifies scripts
+    to import from a new module (e.g., `from tools.paths import RAW_DIR`)
+    but never actually creates that module's file, leaving every modified
+    script with a runtime ImportError on first execution.
+
+    Conservative — handles two main shapes:
+      - Python `from X.Y import Z` / `import X.Y`: resolves `X.Y` against
+        `X/Y.py` and `X/Y/__init__.py`. Skips stdlib + common third-party
+        roots so this only fires on first-party (in-repo) module paths.
+      - JS/TS relative `from './x'` / `from '../x'`: resolves against the
+        importer file's directory and tries `.ts/.tsx/.js/.jsx/index.*`.
+
+    Returns up to 4 phantom-import findings.
+    """
+    if repo is None or not patch.strip():
+        return []
+    try:
+        tracked = set(_tracked_files(repo))
+    except Exception:
+        return []
+    try:
+        new_files = set(_patch_newly_created_files(patch))
+    except Exception:
+        new_files = set()
+    available = tracked | new_files
+    if not available:
+        return []
+    # Build the set of "first-party top-level packages" (directories that
+    # exist in tracked) so we only flag Python imports whose root is local.
+    first_party_roots: set = set()
+    for t in tracked:
+        if "/" in t:
+            first_party_roots.add(t.split("/", 1)[0])
+    findings: List[str] = []
+    current_file = ""
+    is_py = False
+    is_js = False
+    repo_resolved = repo.resolve()
+    for raw_line in patch.splitlines():
+        if raw_line.startswith("+++ "):
+            cand = raw_line[6:].strip() if raw_line.startswith("+++ b/") else raw_line[4:].strip()
+            current_file = cand
+            is_py = cand.endswith(".py")
+            is_js = cand.endswith(_JS_LIKE_EXTS)
+            continue
+        if not raw_line.startswith("+") or raw_line.startswith("+++"):
+            continue
+        body = raw_line[1:]
+        if is_py:
+            m = _PY_IMPORT_FROM_RE.match(body) or _PY_IMPORT_RE.match(body)
+            if not m:
+                continue
+            module = m.group(1)
+            root = module.split(".")[0]
+            # Skip dotless single-token imports (likely stdlib/installed pkg)
+            if "." not in module:
+                continue
+            # Skip stdlib / known third-party roots
+            if root in _PY_THIRD_PARTY_ROOTS:
+                continue
+            # Skip relative imports starting with the file's own package
+            # (we can't resolve `from .X import Y` cheaply without inferring
+            # the file's package — be conservative and skip).
+            if module.startswith("."):
+                continue
+            # Only flag when root looks first-party (some tracked file lives under it)
+            if root not in first_party_roots:
+                continue
+            mod_path = module.replace(".", "/")
+            candidates = [f"{mod_path}.py", f"{mod_path}/__init__.py"]
+            if not any(c in available for c in candidates):
+                findings.append(
+                    f"`{current_file}` imports `{module}` but no `{candidates[0]}` "
+                    f"or `{candidates[1]}` exists in the repo or this patch"
+                )
+                if len(findings) >= 4:
+                    return findings
+        elif is_js:
+            for m in _JS_REL_IMPORT_RE.finditer(body):
+                target = m.group(1).rstrip("/")
+                try:
+                    importer_dir = Path(current_file).parent
+                    resolved_base = (importer_dir / target).resolve()
+                    if not str(resolved_base).startswith(str(repo_resolved)):
+                        # Path traversal outside repo — skip rather than flag
+                        continue
+                    rel = str(resolved_base.relative_to(repo_resolved))
+                except Exception:
+                    continue
+                cands = [
+                    rel, f"{rel}.ts", f"{rel}.tsx", f"{rel}.js",
+                    f"{rel}.jsx", f"{rel}.mjs", f"{rel}.cjs",
+                    f"{rel}/index.ts", f"{rel}/index.tsx",
+                    f"{rel}/index.js", f"{rel}/index.jsx",
+                ]
+                if not any(c in available for c in cands):
+                    findings.append(
+                        f"`{current_file}` imports `{target}` but no matching "
+                        f"file exists in the repo or this patch"
+                    )
+                    if len(findings) >= 4:
+                        return findings
+    return findings
+
+
+def _detect_removed_public_symbols_still_used(
+    patch: str, repo: Optional[Path]
+) -> List[str]:
+    """Detect public symbols the patch removed that other tracked files still
+    reference. Catches the "I refactored away X but didn't update its callers"
+    class of breakage that compile-only checks can't see.
+
+    Returns a list of `name (defined-in <path>, used in N other files)` strings
+    for each removed definition whose name still appears in other tracked files
+    by exact-word grep. Skips names with fewer than 4 characters (too common)
+    and underscore-prefixed names (private convention).
+
+    No subprocess on the patched files; uses git-grep through the tracked
+    file set for the cross-reference. Returns [] when repo is None or grep
+    finds nothing.
+    """
+    if repo is None:
+        return []
+    removed = _patch_removed_definitions(patch, cap=12)
+    if not removed:
+        return []
+    try:
+        changed_paths = set(_patch_changed_files(patch))
+    except Exception:
+        changed_paths = set()
+    out: List[str] = []
+    for name in removed:
+        if len(name) < 4 or name.startswith("_"):
+            continue
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-l", "-w", "-F", "--", name],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=4,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        hits = [
+            p.strip() for p in proc.stdout.splitlines()
+            if p.strip() and p.strip() not in changed_paths
+        ]
+        if not hits:
+            continue
+        sample = ", ".join(hits[:3])
+        more = "" if len(hits) <= 3 else f" +{len(hits) - 3} more"
+        out.append(f"removed `{name}` still referenced in: {sample}{more}")
+        if len(out) >= 5:
+            break
+    return out
+
+
+def _detect_duplicate_default_export(patch: str) -> List[str]:
+    """Detect files that end up with TWO `export default` declarations after
+    the patch — a build-breaking class of bug.
+
+    Observed pattern: appending `export default FoundingPage;` while the
+    function is already exported as `export default function
+    FoundingMembersPage()` creates two default exports and references an
+    undefined identifier.
+    """
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    seen: set = set()
+    current_file = ""
+    is_jsts = False
+    file_added: Dict[str, List[str]] = {}
+    file_kept: Dict[str, List[str]] = {}
+    for raw in patch.splitlines():
+        if raw.startswith("+++ "):
+            current_file = raw[6:].strip() if raw.startswith("+++ b/") else raw[4:].strip()
+            is_jsts = current_file.endswith(_JS_LIKE_EXTS)
+            continue
+        if not is_jsts:
+            continue
+        if raw.startswith("+") and not raw.startswith("+++"):
+            file_added.setdefault(current_file, []).append(raw[1:])
+        elif raw.startswith(" "):
+            file_kept.setdefault(current_file, []).append(raw[1:])
+    default_export_re = re.compile(r"^\s*export\s+default\b")
+    for path in file_added:
+        kept = file_kept.get(path, [])
+        added = file_added.get(path, [])
+        all_lines = kept + added
+        count = sum(1 for ln in all_lines if default_export_re.match(ln))
+        if count >= 2:
+            key = path
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(
+                f"{path}: file has {count} `export default` declarations after "
+                "this patch — JS/TS modules allow at most one. The build will fail."
+            )
+            if len(findings) >= 3:
+                return findings
+    return findings
+
+
+def _detect_duplicate_default_export_in_repo(
+    repo: Optional[Path], patch: str
+) -> List[str]:
+    """Re-check duplicate `export default` declarations against the live
+    post-patch file on disk, not just the diff context. Catches the case
+    where the EXISTING default export sits >5 lines outside any hunk so
+    `_detect_duplicate_default_export`'s patch-only walk misses it.
+
+    Observed in real runs as a recurring correctness gap where a patch added
+    a second `export default function OnboardingScreen` while the original
+    definition was unaffected by the patch (outside hunks).
+    """
+    if repo is None or not patch.strip():
+        return []
+    findings: List[str] = []
+    try:
+        changed = _patch_changed_files(patch)
+    except Exception:
+        return []
+    default_re = re.compile(r"^\s*export\s+default\b", re.MULTILINE)
+    seen: set = set()
+    for relative_path in changed:
+        if not relative_path.endswith(_JS_LIKE_EXTS):
+            continue
+        full = repo / relative_path
+        try:
+            text = full.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        # Strip block comments and line comments cheaply to avoid false-positives.
+        stripped = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+        stripped = re.sub(r"^\s*//.*$", "", stripped, flags=re.MULTILINE)
+        count = len(default_re.findall(stripped))
+        if count >= 2 and relative_path not in seen:
+            seen.add(relative_path)
+            findings.append(
+                f"{relative_path}: file has {count} `export default` declarations "
+                "after the patch — JS/TS modules allow exactly one. The build will fail."
+            )
+            if len(findings) >= 3:
+                return findings
+    return findings
+
+
+def _detect_duplicate_class_bodies(patch: str) -> List[Tuple[str, str]]:
+    """Find pairs of class/interface definitions ADDED in this patch whose
+    field bodies are byte-identical (modulo class name + whitespace).
+
+    Targets the general class-clone antipattern: two new classes with
+    identical field signatures (e.g., a CreateXxx and UpdateXxx DTO that
+    are exact copies). The reference solution for such cases is usually
+    a derived type (`PartialType(CreateXxxDto)` in NestJS, inheritance,
+    etc.) — verbatim copies read as unnecessary churn.
+
+    Conservative: only fires within ADDED lines (the patch's own clones),
+    and only when bodies have at least 2 substantive lines (skips trivial
+    marker classes).
+    """
+    if not patch.strip():
+        return []
+    added_lines: List[str] = []
+    for line in patch.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            added_lines.append(line[1:])
+    if not added_lines:
+        return []
+    added_text = "\n".join(added_lines)
+    classes: List[Tuple[str, str]] = []  # (name, normalized_body)
+    pos = 0
+    while pos < len(added_text):
+        m = _CLASS_BLOCK_RE.search(added_text, pos)
+        if not m:
+            break
+        name = m.group(1)
+        # Walk braces to find body end.
+        body_start = m.end()
+        depth = 1
+        i = body_start
+        while i < len(added_text) and depth > 0:
+            ch = added_text[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            i += 1
+        if depth != 0:
+            break  # unbalanced; bail
+        body = added_text[body_start:i - 1]
+        # Normalize: remove whitespace, strip comments
+        normalized_lines = []
+        for ln in body.splitlines():
+            stripped = ln.strip()
+            if not stripped or stripped.startswith(("//", "/*", "*", "#")):
+                continue
+            normalized_lines.append(re.sub(r"\s+", " ", stripped))
+        if len(normalized_lines) >= 2:
+            classes.append((name, "\n".join(normalized_lines)))
+        pos = i
+    if len(classes) < 2:
+        return []
+    # Group by normalized body
+    from collections import defaultdict
+    by_body: Dict[str, List[str]] = defaultdict(list)
+    for name, body in classes:
+        by_body[body].append(name)
+    dupes: List[Tuple[str, str]] = []
+    for body, names in by_body.items():
+        if len(names) >= 2:
+            for i in range(1, len(names)):
+                dupes.append((names[0], names[i]))
+                if len(dupes) >= 3:
+                    return dupes
+    return dupes
+
+
+def _detect_react_namespace_without_import(patch: str) -> List[str]:
+    """Catch added TSX/JSX lines that use `React.ReactNode`/`React.FC` /
+    `React.CSSProperties` / any `React.X` without an `import React from
+    'react'` line in the same file. Reads as undefined-identifier at
+    runtime (esbuild/vite/swc strip the `React` global by default).
+
+    Convention: either import React explicitly, or use the named import
+    form (`import { ReactNode } from 'react'`). Reference patches consistently
+    use the named form; the `React.X` namespace form without an import is a
+    runtime crash.
+    """
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    current_file = ""
+    is_jsts = False
+    added_uses: Dict[str, set] = {}
+    file_kept: Dict[str, str] = {}
+    file_added: Dict[str, str] = {}
+    for raw in patch.splitlines():
+        if raw.startswith("+++ "):
+            current_file = raw[6:].strip() if raw.startswith("+++ b/") else raw[4:].strip()
+            is_jsts = current_file.endswith(_JS_LIKE_EXTS)
+            file_kept.setdefault(current_file, "")
+            file_added.setdefault(current_file, "")
+            continue
+        if not is_jsts:
+            continue
+        if raw.startswith("+") and not raw.startswith("+++"):
+            body = raw[1:]
+            file_added[current_file] += body + "\n"
+            for m in _REACT_NS_USE_RE.finditer(body):
+                added_uses.setdefault(current_file, set()).add(m.group(1))
+        elif raw.startswith(" "):
+            file_kept[current_file] += raw[1:] + "\n"
+    for path, uses in added_uses.items():
+        if not uses:
+            continue
+        full_seen = (file_kept.get(path, "") + file_added.get(path, ""))
+        if _REACT_IMPORT_RE.search(full_seen):
+            continue
+        sample = sorted(uses)[:3]
+        findings.append(
+            f"{path}: uses `React.{', React.'.join(sample)}` without "
+            "`import React from 'react'` in the file. Either add the React "
+            "import or switch to named imports "
+            f"(`import {{ {', '.join(sample)} }} from 'react'`)."
+        )
+        if len(findings) >= 3:
+            break
+    return findings
+
+
+def _detect_react_hooks_stale_closure(patch: str) -> List[str]:
+    """Detect `useCallback`/`useMemo`/`useEffect`/`useLayoutEffect` calls added
+    by the patch whose deps array OMITS a variable the body reads.
+
+    Stale-closure bugs are a top recurring correctness gap (observed cases had
+    `useCallback(()=>{ ... }, [])` while the body referenced state). Catches
+    the case where the deps list is empty OR is missing an obvious identifier
+    the body uses.
+    """
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    seen: set = set()
+    current_file = ""
+    is_react = False
+    added_lines: Dict[str, List[str]] = {}
+    for raw in patch.splitlines():
+        if raw.startswith("+++ "):
+            current_file = raw[6:].strip() if raw.startswith("+++ b/") else raw[4:].strip()
+            is_react = current_file.endswith((".tsx", ".jsx", ".ts", ".js"))
+            continue
+        if not is_react or not raw.startswith("+") or raw.startswith("+++"):
+            continue
+        added_lines.setdefault(current_file, []).append(raw[1:])
+    for path, lines in added_lines.items():
+        blob = "\n".join(lines)
+        for m in _REACT_HOOK_DEP_RE.finditer(blob):
+            hook, body, deps = m.group(1), m.group(2), m.group(3)
+            deps_set = {d.strip() for d in deps.split(",") if d.strip()}
+            body_idents = set(_HOOK_IDENT_RE.findall(body))
+            body_idents -= _HOOK_BUILTIN_NAMES
+            # Filter to identifiers that look like state/prop refs: camelCase
+            # starting lowercase, length ≥3, not declared inside the body.
+            local_decls = set(re.findall(r"\b(?:const|let|var)\s+(\w+)", body))
+            candidate_state = {
+                ident for ident in body_idents
+                if len(ident) >= 3 and ident[0].islower()
+                and ident not in local_decls
+                and ident not in deps_set
+            }
+            # Heuristic filter: only flag if there's a strong reason to think
+            # the missing ident IS a hook dependency (capitalized state-like
+            # variables or refs / common state patterns). Look for `setXxx`
+            # being called → `xxx` likely state.
+            likely_state = {
+                ident for ident in candidate_state
+                if (f"set{ident[0].upper()}{ident[1:]}" in body_idents)  # setXxx pattern
+                or (f"{ident}.current" in body)  # ref-like access
+            }
+            if likely_state:
+                if not deps_set:
+                    msg = (
+                        f"{path}: `{hook}(() => {{ ... }}, [])` reads state "
+                        f"`{', '.join(sorted(likely_state)[:3])}` but the deps "
+                        "array is empty — stale-closure bug; add the deps."
+                    )
+                else:
+                    msg = (
+                        f"{path}: `{hook}` deps `[{', '.join(sorted(deps_set)[:3])}]` "
+                        f"is missing state refs `{', '.join(sorted(likely_state)[:3])}` "
+                        "the body reads — add them or memoize."
+                    )
+                key = (path, hook, tuple(sorted(likely_state)))
+                if key in seen:
+                    continue
+                seen.add(key)
+                findings.append(msg)
+                if len(findings) >= 4:
+                    return findings
+    return findings
+
+
+def _detect_hook_inside_iterator_callback(patch: str) -> List[str]:
+    """Detect React `useX(...)` hook calls invoked inside `.map()` /
+    `.filter()` / `.forEach()` and similar array-iterator callbacks on
+    added lines. Violates React's rules-of-hooks (must be top-level inside
+    the component, not inside callbacks / loops / conditionals) and breaks
+    at runtime with a hard error.
+
+    Observed in real runs as a recurring correctness gap where a patch
+    called `useAnimatedStyle` inside a `.map()` callback in an Onboarding
+    screen, breaking the build under React's runtime hook validator.
+    """
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    current_file = ""
+    is_jsts = False
+    in_iterator_cb = 0
+    depth = 0
+    seen: set = set()
+    for raw in patch.splitlines():
+        if raw.startswith("+++ "):
+            current_file = raw[6:].strip() if raw.startswith("+++ b/") else raw[4:].strip()
+            is_jsts = current_file.endswith(_JS_LIKE_EXTS)
+            in_iterator_cb = 0
+            depth = 0
+            continue
+        if not is_jsts:
+            continue
+        if raw.startswith("@@"):
+            in_iterator_cb = 0
+            depth = 0
+            continue
+        if not (raw.startswith("+") or raw.startswith(" ")):
+            continue
+        if raw.startswith("+++"):
+            continue
+        body = raw[1:]
+        # Track brace depth and whether we just entered an iterator callback.
+        if in_iterator_cb > 0:
+            opens = body.count("{") + body.count("(")
+            closes = body.count("}") + body.count(")")
+            depth += opens - closes
+            if depth <= 0:
+                in_iterator_cb = max(0, in_iterator_cb - 1)
+                depth = 0
+            elif raw.startswith("+"):
+                for m in _HOOK_CALL_RE.finditer(body):
+                    name = m.group(1)
+                    if name in {"useEffect", "useState", "useRef", "useMemo", "useCallback", "useContext", "useReducer", "useLayoutEffect", "useImperativeHandle"} or name.startswith("use"):
+                        key = (current_file, name, body.strip()[:50])
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        findings.append(
+                            f"{current_file}: React hook `{name}()` called inside an array-iterator "
+                            f"callback (`.map`/`.filter`/`.forEach`/...). Rules-of-hooks forbids this; "
+                            "lift the hook to the component's top level and compute the per-item value "
+                            f"differently. Snippet: `{body.strip()[:90]}`"
+                        )
+                        if len(findings) >= 3:
+                            return findings
+        if _ITERATOR_CB_RE.search(body):
+            in_iterator_cb += 1
+            opens = body.count("{") + body.count("(")
+            closes = body.count("}") + body.count(")")
+            depth = max(1, opens - closes)
+    return findings
+
+
+def _detect_useeffect_missing_cleanup(patch: str) -> List[str]:
+    """Detect `useEffect` calls added by the patch that subscribe / set a
+    timer / open a connection but DON'T return a cleanup function.
+
+    Observed pattern: missing-cleanup effects are a common defect class.
+    Reference solutions return cleanup; missing it causes memory leaks
+    or double subscriptions on re-render.
+    """
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    seen: set = set()
+    current_file = ""
+    is_react = False
+    added_lines: Dict[str, List[str]] = {}
+    for raw in patch.splitlines():
+        if raw.startswith("+++ "):
+            current_file = raw[6:].strip() if raw.startswith("+++ b/") else raw[4:].strip()
+            is_react = current_file.endswith((".tsx", ".jsx", ".ts", ".js"))
+            continue
+        if not is_react or not raw.startswith("+") or raw.startswith("+++"):
+            continue
+        added_lines.setdefault(current_file, []).append(raw[1:])
+    leak_patterns = (
+        ("setInterval", "clearInterval"),
+        ("setTimeout", "clearTimeout"),
+        (".subscribe(", ".unsubscribe("),
+        (".addEventListener(", ".removeEventListener("),
+        ("new WebSocket", ".close("),
+        ("new EventSource", ".close("),
+        (".observe(", ".disconnect("),
+    )
+    for path, lines in added_lines.items():
+        blob = "\n".join(lines)
+        for m in _REACT_HOOK_NODEPS_RE.finditer(blob):
+            body = m.group(2)
+            for setup, teardown in leak_patterns:
+                if setup in body and teardown not in body:
+                    # Also check for `return () =>` or `return function`
+                    if not re.search(r"return\s+(?:\([^)]*\)\s*=>|function\b)", body):
+                        snippet = setup.strip("(.")
+                        key = (path, snippet)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        findings.append(
+                            f"{path}: useEffect uses `{snippet}(...)` without "
+                            f"a cleanup function returning `{teardown.strip('.()')}` "
+                            "— add `return () => { ... }` to avoid leaks/double-fire."
+                        )
+                        if len(findings) >= 3:
+                            return findings
+                        break
+    return findings
+
+
+def _detect_useeffect_setstate_loop(patch: str) -> List[str]:
+    """Detect `useEffect(() => { setX(...) }, [x, ...])` where a state setter
+    inside the effect would mutate one of the listed dependencies, causing an
+    infinite re-render loop that crashes the component.
+
+    Pattern: the dep array contains `x` and the body calls `setX(...)` — every
+    update of `x` re-runs the effect which calls setX again, looping forever.
+    """
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    seen: set = set()
+    current_file = ""
+    is_react = False
+    file_added: Dict[str, List[str]] = {}
+    for raw in patch.splitlines():
+        if raw.startswith("+++ "):
+            current_file = raw[6:].strip() if raw.startswith("+++ b/") else raw[4:].strip()
+            is_react = current_file.endswith((".tsx", ".jsx", ".ts", ".js"))
+            continue
+        if not is_react or not raw.startswith("+") or raw.startswith("+++"):
+            continue
+        file_added.setdefault(current_file, []).append(raw[1:])
+
+    effect_re = re.compile(
+        r"\b(useEffect|useLayoutEffect)\s*\("
+        r"(?:\s*\(\s*[^)]*\)\s*=>\s*\{|\s*async\s*\(\s*[^)]*\)\s*=>\s*\{)"
+        r"(.*?)"
+        r"\}\s*,\s*\[\s*([^\]]*)\s*\]\s*\)",
+        re.DOTALL,
+    )
+    for path, lines in file_added.items():
+        blob = "\n".join(lines)
+        for m in effect_re.finditer(blob):
+            hook, body, deps = m.group(1), m.group(2), m.group(3)
+            dep_names = {d.strip() for d in deps.split(",") if d.strip()}
+            if not dep_names:
+                continue
+            # For each dep, check if the body calls setDep(...) — the React
+            # convention is `setX` for state `x`. Case-sensitive match.
+            for dep in dep_names:
+                if not dep or not dep[0].islower():
+                    continue
+                setter = "set" + dep[0].upper() + dep[1:]
+                if re.search(rf"\b{re.escape(setter)}\s*\(", body):
+                    key = (path, hook, dep)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    findings.append(
+                        f"{path}: `{hook}(()=>{{ ... {setter}(...) ...}}, [{dep}])` — "
+                        f"the effect sets `{dep}` while `{dep}` is a dependency, "
+                        "causing an infinite re-render loop. Either remove "
+                        f"`{dep}` from the dep array, or use a ref/functional "
+                        "setState to break the cycle."
+                    )
+                    if len(findings) >= 3:
+                        return findings
+                    break  # one finding per effect
+    return findings
+
+
+def _detect_nextjs_client_server_violation(patch: str) -> List[str]:
+    """Next.js server/client boundary violations on added lines.
+
+    Two fatal patterns observed in real runs:
+      1. `'use client'` directive + `async function Component()` — async components
+         are server-only; combining with 'use client' is a build-time error.
+      2. `useState` / `useEffect` inside an async function — client hooks can't be
+         called from server components (async functions are server components by
+         default in app router).
+
+    Conservative: only fires on JSX/TSX files in app/ or pages/ that look like
+    Next.js routes/components.
+    """
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    seen: set = set()
+    current_file = ""
+    is_nextish = False
+    file_added: Dict[str, List[str]] = {}
+    for raw in patch.splitlines():
+        if raw.startswith("+++ "):
+            current_file = raw[6:].strip() if raw.startswith("+++ b/") else raw[4:].strip()
+            is_nextish = (
+                current_file.endswith((".tsx", ".jsx"))
+                and ("app/" in current_file or "pages/" in current_file or "components/" in current_file)
+            )
+            continue
+        if not is_nextish or not raw.startswith("+") or raw.startswith("+++"):
+            continue
+        file_added.setdefault(current_file, []).append(raw[1:])
+
+    use_client_re = re.compile(r"^\s*['\"]use client['\"]\s*;?\s*$")
+    async_component_re = re.compile(
+        r"^\s*(?:export\s+(?:default\s+)?)?async\s+function\s+([A-Z]\w*)\s*\("
+    )
+    async_arrow_re = re.compile(
+        r"^\s*(?:export\s+(?:default\s+)?)?const\s+([A-Z]\w*)\s*=\s*async\s*[(<]"
+    )
+    client_hook_re = re.compile(r"\b(useState|useEffect|useReducer|useCallback|useMemo|useRef)\s*\(")
+
+    for path, lines in file_added.items():
+        has_use_client = any(use_client_re.match(ln) for ln in lines[:20])
+        async_components: List[Tuple[int, str]] = []
+        for idx, ln in enumerate(lines):
+            m = async_component_re.match(ln) or async_arrow_re.match(ln)
+            if m:
+                async_components.append((idx, m.group(1)))
+        if has_use_client and async_components:
+            for _idx, name in async_components[:2]:
+                key = (path, name, "use_client_async")
+                if key in seen:
+                    continue
+                seen.add(key)
+                findings.append(
+                    f"{path}: `'use client'` directive present AND `async function "
+                    f"{name}(...)` declared — async components are server-only in "
+                    "Next.js app router. Either remove `'use client'` and use the "
+                    "component as a server component, OR remove `async` and use "
+                    "client-side data fetching (useEffect / SWR / react-query)."
+                )
+                if len(findings) >= 3:
+                    return findings
+        # useState inside async function (without 'use client' — server component)
+        if not has_use_client and async_components:
+            # Scan lines after each async component header for client-hook calls
+            for start_idx, name in async_components[:2]:
+                # Look at next 40 lines for a client hook
+                for ln in lines[start_idx + 1: start_idx + 41]:
+                    if client_hook_re.search(ln):
+                        key = (path, name, "hook_in_server")
+                        if key in seen:
+                            break
+                        seen.add(key)
+                        findings.append(
+                            f"{path}: `async function {name}(...)` (server component) "
+                            "contains client-only hook calls (useState/useEffect/etc). "
+                            "Server components cannot use React hooks. Either remove the "
+                            "`async` and add `'use client'` directive, or move the "
+                            "interactive UI into a separate client component."
+                        )
+                        if len(findings) >= 3:
+                            return findings
+                        break
+    return findings
+
+
+def _detect_rust_char_literal_misuse(patch: str) -> List[str]:
+    """Catch multi-character single-quote 'strings' in Rust — invalid char literals.
+
+    Rust's char literal must be exactly one character (or one valid escape).
+    Forms like `windows_subsystem = 'windows'` are compile errors — string
+    literals use double quotes. Observed in real runs as a compile failure
+    on `#![cfg_attr(.., windows_subsystem = 'windows')]`.
+    Runs as a regex fallback since `rustc` is often unavailable in worker.
+    """
+    if not patch.strip():
+        return []
+    findings: List[str] = []
+    current_file = ""
+    is_rust = False
+    seen: set = set()
+    for raw in patch.splitlines():
+        if raw.startswith("+++ "):
+            current_file = raw[6:].strip() if raw.startswith("+++ b/") else raw[4:].strip()
+            is_rust = current_file.endswith(".rs")
+            continue
+        if not is_rust:
+            continue
+        if not raw.startswith("+") or raw.startswith("+++"):
+            continue
+        body = raw[1:]
+        cidx = body.find("//")
+        if cidx >= 0:
+            body = body[:cidx]
+        for m in _RUST_CHAR_LIT_RE.finditer(body):
+            tok = m.group(1)
+            head = body[: m.start()]
+            dq = 0
+            i = 0
+            while i < len(head):
+                if head[i] == "\\" and i + 1 < len(head):
+                    i += 2
+                    continue
+                if head[i] == '"':
+                    dq += 1
+                i += 1
+            if dq % 2 == 1:
+                continue
+            key = (current_file, tok)
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(
+                f"{current_file}: invalid Rust char literal `'{tok}'` — char literals "
+                "must contain exactly one character; use double quotes for string "
+                f'literals (e.g. `"{tok}"`).'
+            )
+            if len(findings) >= 4:
+                return findings
+    return findings
+
+
+def _detect_nullable_inner_join_fk(patch: str, repo: Optional[Path]) -> List[str]:
+    """Find `INNER JOIN` clauses added by the patch whose join FK column is
+    not marked NOT NULL anywhere in the repo's schema/migration files.
+
+    Targets the general class of FK-shaped JOIN antipatterns: a patch
+    INNER-JOINs a related table on a column that the schema allows to be
+    NULL, which silently drops rows or fails depending on engine. Catches
+    the same bug pattern in SQL, TypeORM, EF Core, and SQLAlchemy schemas.
+
+    Conservative — fires only when:
+      (a) the patch's added lines contain an `INNER JOIN`,
+      (b) the join condition references a column ending in `_id` / `Id` /
+          `_ref` / `Ref` (i.e., FK-shaped),
+      (c) that column appears in at least one tracked schema file,
+      (d) no `NOT NULL` constraint or `nullable: false` decorator is
+          found near it.
+    Returns suspect FK column names (capped at 3).
+    """
+    if repo is None or not patch.strip():
+        return []
+    added_lines: List[str] = []
+    for line in patch.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            added_lines.append(line[1:])
+    added = "\n".join(added_lines)
+    if not re.search(r"\bINNER\s+JOIN\b", added, re.IGNORECASE):
+        return []
+    fk_cols: set = set()
+    for m in re.finditer(r"\b\w+\.([a-zA-Z_]\w*(?:_id|Id|_ref|Ref))\b", added):
+        col = m.group(1)
+        if col.lower() in {"id", "ref"}:
+            continue
+        fk_cols.add(col)
+    if not fk_cols:
+        return []
+    try:
+        tracked = _tracked_files(repo)
+    except Exception:
+        return []
+    schema_files = [
+        t for t in tracked
+        if t.lower().endswith(".sql")
+        or "migration" in t.lower()
+        or "schema" in t.lower()
+        or "/models/" in t.lower()
+        or "/entities/" in t.lower()
+    ][:40]
+    if not schema_files:
+        return []
+    blob_parts: List[str] = []
+    for sf in schema_files:
+        try:
+            blob_parts.append((repo / sf).read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+    if not blob_parts:
+        return []
+    blob = "\n".join(blob_parts)
+    blob_lower = blob.lower()
+    findings: List[str] = []
+    for col in sorted(fk_cols):
+        if col.lower() not in blob_lower:
+            continue  # column not in schema — likely an alias, skip
+        # SQL NOT NULL on the column's definition line
+        sql_nn = re.compile(
+            r"[`'\"]?" + re.escape(col) + r"[`'\"]?\s+[A-Za-z_]\w*[^,;]*?\bNOT\s+NULL\b",
+            re.IGNORECASE,
+        )
+        if sql_nn.search(blob):
+            continue
+        # TypeORM / EF Core: @Column({ nullable: false }) ... colName
+        orm_nn = re.compile(
+            r"(nullable\s*:\s*false|\[Required\]|\.IsRequired\(\))[^\n]{0,200}?\b"
+            + re.escape(col) + r"\b",
+            re.IGNORECASE | re.DOTALL,
+        )
+        if orm_nn.search(blob):
+            continue
+        # Pydantic/SQLAlchemy: nullable=False near the column
+        sqlalch_nn = re.compile(
+            r"\b" + re.escape(col) + r"\b[^\n]{0,200}?nullable\s*=\s*False",
+            re.IGNORECASE,
+        )
+        if sqlalch_nn.search(blob):
+            continue
+        findings.append(col)
+        if len(findings) >= 3:
+            break
+    return findings
+
+
+def _detect_sql_unknown_columns(patch: str, repo: Optional[Path]) -> List[str]:
+    """Look for `alias.column` references in added SQL fragments whose
+    column name appears NOWHERE in the repo's schema/migration files.
+
+    Targets the general class of typo'd or stale SQL column references
+    (e.g., a query writes `p.foo_bar_baz` but no such column was ever
+    declared anywhere in the schema) — these cause runtime DB errors
+    that compile-only checks cannot see.
+
+    Conservative: only fires when (a) the added lines contain SQL keywords,
+    (b) the repo has schema/migration files we can validate against, and
+    (c) the referenced column appears in no tracked schema file (whole-repo
+    substring miss). Skips short and stopword-like names.
+    """
+    if repo is None or not patch.strip():
+        return []
+    added: List[str] = []
+    for line in patch.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            added.append(line[1:])
+    if not added:
+        return []
+    candidate_cols: set = set()
+    for line in added:
+        if not _SQL_KEYWORD_RE.search(line):
+            continue
+        for m in _SQL_QUALIFIED_COL_RE.finditer(line):
+            col = m.group(2)
+            if col.lower() in _SQL_COL_STOPWORDS:
+                continue
+            candidate_cols.add(col)
+    if not candidate_cols:
+        return []
+    try:
+        tracked = _tracked_files(repo)
+    except Exception:
+        return []
+    schema_files = [
+        t for t in tracked
+        if t.lower().endswith(".sql")
+        or "migration" in t.lower()
+        or "schema" in t.lower()
+        or "/models/" in t.lower()
+        or "/entities/" in t.lower()
+    ]
+    if not schema_files:
+        return []
+    # Build a single lowercase blob of every schema file's content; check
+    # candidate column tokens against it via substring presence (cheap and
+    # robust to many ORM/SQL flavors).
+    blob_parts: List[str] = []
+    for sf in schema_files[:40]:
+        try:
+            blob_parts.append((repo / sf).read_text(encoding="utf-8", errors="replace").lower())
+        except Exception:
+            continue
+    if not blob_parts:
+        return []
+    blob = "\n".join(blob_parts)
+    missing: List[str] = []
+    for col in sorted(candidate_cols):
+        if col.lower() not in blob:
+            missing.append(col)
+        if len(missing) >= 4:
+            break
+    return missing
+
+
+def _detect_unused_imports_in_new_files(patch: str) -> List[str]:
+    """For brand-new Python / JS / TS files the patch creates, flag imported
+    names that the file's own body never uses. Common loss mode: agent
+    adds an import for a planned refactor but never actually references
+    the imported symbol (or leaves it stale after deleting its usage).
+    Flagged in review as 'broken unused import'.
+
+    Limited to NEW files (where every line is added) to avoid false
+    positives on imports whose usages live in pre-existing, non-added
+    lines. Conservative — only flags identifier-bound imports, never
+    side-effect-only imports like `import './polyfill'`.
+    """
+    if not patch.strip():
+        return []
+    file_lines: Dict[str, List[str]] = {}
+    new_files: set = set()
+    current = ""
+    for raw in patch.splitlines():
+        if raw.startswith("diff --git "):
+            m = re.match(r"diff --git a/(.+?) b/(.+)$", raw)
+            if m:
+                current = m.group(2).strip()
+                file_lines.setdefault(current, [])
+            continue
+        if raw.startswith("new file mode"):
+            if current:
+                new_files.add(current)
+            continue
+        if raw.startswith("+++ ") or raw.startswith("--- "):
+            continue
+        if current and raw.startswith("+") and not raw.startswith("+++"):
+            file_lines[current].append(raw[1:])
+    if not new_files:
+        return []
+    findings: List[str] = []
+    for path in new_files:
+        is_py = path.endswith(".py")
+        is_js = path.endswith(_JS_LIKE_EXTS)
+        if not (is_py or is_js):
+            continue
+        lines = file_lines.get(path, [])
+        if not lines:
+            continue
+        # Collect imported names
+        imported: List[Tuple[str, str]] = []  # (name, raw_line)
+        for ln in lines:
+            stripped = ln.strip()
+            if is_py:
+                if stripped.startswith("from "):
+                    # from X import a, b as c, d
+                    m = re.match(r"from\s+[\w\.]+\s+import\s+(.+)", stripped)
+                    if not m:
+                        continue
+                    raw_names = m.group(1).rstrip(" \\")
+                    raw_names = raw_names.split("#", 1)[0]
+                    # Skip `from x import *`
+                    if "*" in raw_names:
+                        continue
+                    for part in raw_names.split(","):
+                        part = part.strip().strip("()").strip()
+                        if " as " in part:
+                            part = part.split(" as ")[1].strip()
+                        if part and part.isidentifier():
+                            imported.append((part, stripped))
+                elif stripped.startswith("import "):
+                    m = re.match(r"import\s+(.+)", stripped)
+                    if not m:
+                        continue
+                    raw_names = m.group(1).split("#", 1)[0].strip()
+                    for part in raw_names.split(","):
+                        part = part.strip()
+                        if " as " in part:
+                            name = part.split(" as ")[1].strip()
+                        else:
+                            name = part.split(".")[0].strip()
+                        if name and name.isidentifier():
+                            imported.append((name, stripped))
+            elif is_js:
+                m = _JS_IMPORT_DEFAULT_RE.match(stripped)
+                if m:
+                    imported.append((m.group(1), stripped)); continue
+                m = _JS_IMPORT_NAMESPACE_RE.match(stripped)
+                if m:
+                    imported.append((m.group(1), stripped)); continue
+                m = _JS_IMPORT_NAMED_RE.match(stripped)
+                if m:
+                    for part in m.group(1).split(","):
+                        part = part.strip()
+                        if " as " in part:
+                            part = part.split(" as ")[1].strip()
+                        if part and part.isidentifier() and part != "default":
+                            imported.append((part, stripped))
+        if not imported:
+            continue
+        # Build usage token set from the body — exclude import lines themselves
+        non_import_lines = []
+        for ln in lines:
+            s = ln.strip()
+            if is_py and (s.startswith("import ") or s.startswith("from ")):
+                continue
+            if is_js and (s.startswith("import ") or "require(" in s):
+                continue
+            non_import_lines.append(ln)
+        usage_text = "\n".join(non_import_lines)
+        usage_tokens = set(_PY_USAGE_TOKEN_RE.findall(usage_text))
+        for name, _src in imported:
+            if name not in usage_tokens:
+                findings.append(f"`{path}` imports `{name}` but never uses it")
+                if len(findings) >= 4:
+                    return findings
+    return findings
+
+
+
+def _check_ts_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    """`tsc --noEmit --noResolve` parser check for .ts / .tsx files.
+
+    Targets the types/annotations alignment axis that reviewers weigh heavily
+    on JS/TS-heavy tasks. Catches the class of bug where a function is called
+    with the wrong type (e.g. passing a QueryDocumentSnapshot to a function
+    that expects a DocumentReference) — invisible to brace-balance and to
+    `node --check`, but visible to tsc.
+
+    Best-effort with conservative defaults:
+      - Prefer project-local node_modules/.bin/tsc over global; falls back to
+        global `tsc` when present.
+      - `--noResolve` skips module resolution so we don't drown in errors from
+        the repo's transitively imported dependencies (this would otherwise dwarf
+        the actual signal from the file we touched).
+      - `--skipLibCheck --allowJs` makes the check tolerant of mixed JS/TS repos.
+      - Output is filtered to errors that name the touched file's path on the
+        left-hand side; unrelated noise is dropped.
+      - Returns None (silent pass) when tsc is unavailable or output is empty —
+        we'd rather skip the check than burn a refinement turn on transient
+        resolver noise we can't act on.
+    """
+    local_tsc = repo / "node_modules" / ".bin" / "tsc"
+    if local_tsc.is_file():
+        tsc_cmd = "./" + str(local_tsc.relative_to(repo))
+    elif _has_executable("tsc"):
+        tsc_cmd = "tsc"
+    else:
+        return None
+    cmd = (
+        f"{tsc_cmd} --noEmit --noResolve --skipLibCheck --allowJs "
+        f"--target esnext --module esnext --jsx preserve "
+        f"{_shell_quote(relative_path)}"
+    )
+    proc_result = run_command(cmd, repo, timeout=_SYNTAX_TIMEOUT)
+    if proc_result.exit_code == 0:
+        return None
+    raw = (proc_result.stdout or proc_result.stderr or "").strip()
+    if not raw:
+        return None
+    # tsc errors look like:  src/foo.ts(12,5): error TS2345: ...
+    # or                     src/foo.ts:12:5 - error TS2345: ...
+    prefix_a = relative_path + "("
+    prefix_b = relative_path + ":"
+    relevant = [
+        line for line in raw.splitlines()
+        if line.startswith(prefix_a) or line.startswith(prefix_b)
+    ]
+    if not relevant:
+        return None
+    return f"{relative_path}: {relevant[0]}"
+
+
+def _check_python_runtime_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Static name-resolution check beyond py_compile syntax parsing.
+
+    `py_compile` only catches syntax errors. It does NOT catch:
+      - NameError from typo'd identifier references
+      - undefined-but-used local variables introduced by an edit
+      - mismatched function signatures in calls within the same module
+
+    This helper walks the module's AST and verifies that every Name reference
+    resolves to either: a builtin, a global defined in the module, an import,
+    a parameter, or a local binding seen earlier in the same scope.
+
+    Implemented with `ast` only — no subprocess, no execution of the user
+    code. Returns the first unresolved-name finding or None when everything
+    resolves. False positives on dynamic patterns (getattr-based dispatch,
+    exec/eval, late-bound class attributes) are suppressed by erring on the
+    side of "skip when ambiguous."
+    """
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    try:
+        import ast as _ast
+        import builtins as _builtins
+        tree = _ast.parse(source)
+    except Exception:
+        # If the file doesn't parse, _check_python_syntax_one handles it.
+        return None
+
+    builtin_names = set(dir(_builtins))
+    # Collect module-level bindings: top-level defs, classes, assignments, imports.
+    module_defined: set = set()
+    star_imports = False
+    for node in tree.body:
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
+            module_defined.add(node.name)
+        elif isinstance(node, _ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, _ast.Name):
+                    module_defined.add(tgt.id)
+                elif isinstance(tgt, (_ast.Tuple, _ast.List)):
+                    for elt in tgt.elts:
+                        if isinstance(elt, _ast.Name):
+                            module_defined.add(elt.id)
+        elif isinstance(node, _ast.AnnAssign) and isinstance(node.target, _ast.Name):
+            module_defined.add(node.target.id)
+        elif isinstance(node, _ast.AugAssign) and isinstance(node.target, _ast.Name):
+            module_defined.add(node.target.id)
+        elif isinstance(node, _ast.Import):
+            for alias in node.names:
+                module_defined.add((alias.asname or alias.name).split(".")[0])
+        elif isinstance(node, _ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "*":
+                    star_imports = True
+                    continue
+                module_defined.add(alias.asname or alias.name)
+        elif isinstance(node, _ast.If):
+            for sub in _ast.walk(node):
+                if isinstance(sub, _ast.Name) and isinstance(sub.ctx, _ast.Store):
+                    module_defined.add(sub.id)
+                elif isinstance(sub, _ast.Import):
+                    for alias in sub.names:
+                        module_defined.add((alias.asname or alias.name).split(".")[0])
+                elif isinstance(sub, _ast.ImportFrom):
+                    for alias in sub.names:
+                        if alias.name != "*":
+                            module_defined.add(alias.asname or alias.name)
+        elif isinstance(node, _ast.Try):
+            for sub in _ast.walk(node):
+                if isinstance(sub, _ast.Name) and isinstance(sub.ctx, _ast.Store):
+                    module_defined.add(sub.id)
+                elif isinstance(sub, _ast.Import):
+                    for alias in sub.names:
+                        module_defined.add((alias.asname or alias.name).split(".")[0])
+                elif isinstance(sub, _ast.ImportFrom):
+                    for alias in sub.names:
+                        if alias.name != "*":
+                            module_defined.add(alias.asname or alias.name)
+
+    # If the file uses `from x import *` we can't know what's defined; bail.
+    if star_imports:
+        return None
+
+    def _check_scope(fn_node) -> Optional[str]:
+        # Skip functions that contain nested functions/lambdas/classes — closure
+        # name resolution is genuinely subtle and a single-scope walk would
+        # conflate inner with outer (e.g., a nested function's `stdout`
+        # parameter is read inside the nested body but isn't a name in the
+        # outer scope). Conservative skip — better to miss a real NameError
+        # than false-positive a valid closure and waste a syntax_fix turn.
+        for sub in _ast.walk(fn_node):
+            if sub is fn_node:
+                continue
+            if isinstance(sub, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.Lambda, _ast.ClassDef)):
+                return None
+        scope: set = set()
+        for a in fn_node.args.posonlyargs + fn_node.args.args + fn_node.args.kwonlyargs:
+            scope.add(a.arg)
+        if fn_node.args.vararg:
+            scope.add(fn_node.args.vararg.arg)
+        if fn_node.args.kwarg:
+            scope.add(fn_node.args.kwarg.arg)
+        for sub in _ast.walk(fn_node):
+            if isinstance(sub, _ast.Name) and isinstance(sub.ctx, (_ast.Store, _ast.Del)):
+                scope.add(sub.id)
+            elif isinstance(sub, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
+                scope.add(sub.name)
+            elif isinstance(sub, _ast.Global):
+                for n in sub.names:
+                    scope.add(n)
+            elif isinstance(sub, _ast.Nonlocal):
+                for n in sub.names:
+                    scope.add(n)
+            elif isinstance(sub, _ast.ExceptHandler) and sub.name:
+                scope.add(sub.name)
+            elif isinstance(sub, (_ast.For, _ast.AsyncFor)):
+                if isinstance(sub.target, _ast.Name):
+                    scope.add(sub.target.id)
+                elif isinstance(sub.target, (_ast.Tuple, _ast.List)):
+                    for elt in sub.target.elts:
+                        if isinstance(elt, _ast.Name):
+                            scope.add(elt.id)
+            elif isinstance(sub, (_ast.With, _ast.AsyncWith)):
+                for item in sub.items:
+                    if item.optional_vars and isinstance(item.optional_vars, _ast.Name):
+                        scope.add(item.optional_vars.id)
+            elif isinstance(sub, (_ast.ListComp, _ast.SetComp, _ast.DictComp, _ast.GeneratorExp)):
+                for gen in sub.generators:
+                    if isinstance(gen.target, _ast.Name):
+                        scope.add(gen.target.id)
+                    elif isinstance(gen.target, (_ast.Tuple, _ast.List)):
+                        for elt in gen.target.elts:
+                            if isinstance(elt, _ast.Name):
+                                scope.add(elt.id)
+            # Function-local imports bind names too — without this the check
+            # falsely flags every `from collections import defaultdict` style
+            # local import as undefined, wasting a syntax_fix turn on valid code.
+            elif isinstance(sub, _ast.Import):
+                for alias in sub.names:
+                    scope.add((alias.asname or alias.name).split(".")[0])
+            elif isinstance(sub, _ast.ImportFrom):
+                for alias in sub.names:
+                    if alias.name == "*":
+                        # Star import inside a function: can't know what's defined; bail.
+                        return None
+                    scope.add(alias.asname or alias.name)
+            # Lambda parameters bind names within the lambda body. Without
+            # this, `sorted(xs, key=lambda t: t[0])` falsely flags `t` as
+            # undefined. We add to the enclosing scope: over-permissive (a
+            # lambda param shouldn't leak out) but never produces false
+            # positives, only false negatives — the right side of the
+            # tradeoff for a name-resolution sanity check.
+            elif isinstance(sub, _ast.Lambda):
+                for a in sub.args.posonlyargs + sub.args.args + sub.args.kwonlyargs:
+                    scope.add(a.arg)
+                if sub.args.vararg:
+                    scope.add(sub.args.vararg.arg)
+                if sub.args.kwarg:
+                    scope.add(sub.args.kwarg.arg)
+        for sub in _ast.walk(fn_node):
+            if isinstance(sub, _ast.Name) and isinstance(sub.ctx, _ast.Load):
+                if sub.id in scope:
+                    continue
+                if sub.id in module_defined:
+                    continue
+                if sub.id in builtin_names:
+                    continue
+                if sub.id.startswith("_"):
+                    continue
+                lineno = getattr(sub, "lineno", "?")
+                return f"{relative_path}:{lineno}: name '{sub.id}' may not be defined in scope of `{fn_node.name}`"
+        return None
+
+    # Only analyze TOP-LEVEL function definitions. Methods inside classes
+    # and functions nested in other functions read names from enclosing
+    # scopes (self/cls, captured closure vars) that this single-scope
+    # check cannot see — analyzing them in isolation produces false
+    # positives like flagging `raw_cmd` in a nested helper that legally
+    # closes over the outer function's binding.
+    for node in tree.body:
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            result = _check_scope(node)
+            if result is not None:
+                return result
+    return None
+
+
+def _check_java_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Best-effort Java parse via `javac -Xlint:none -implicit:none -proc:none`.
+
+    Skips when javac is unavailable. Uses `-d /tmp` and `-classpath ""` to avoid
+    polluting the working tree and to prevent it from trying to resolve actual
+    project classpath (which would flood with unresolvable-symbol errors). Only
+    `error:` lines that point at our file are surfaced.
+    """
+    if not _has_executable("javac"):
+        return None
+    full = repo / relative_path
+    if not full.exists() or not full.is_file():
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                "javac", "-Xlint:none", "-implicit:none", "-proc:none",
+                "-d", "/tmp", "-classpath", "", str(full),
+            ],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=_SYNTAX_TIMEOUT,
+        )
+    except Exception:
+        return None
+    if proc.returncode == 0:
+        return None
+    err = (proc.stderr or "").strip()
+    if not err:
+        return None
+    skip_markers = (
+        "cannot find symbol", "package does not exist", "cannot access",
+        "class file for", "annotation processing",
+    )
+    relevant: List[str] = []
+    for line in err.splitlines():
+        low = line.lower()
+        if "error:" not in low:
+            continue
+        if any(s in low for s in skip_markers):
+            continue
+        relevant.append(line.strip())
+    if not relevant:
+        return None
+    return f"{relative_path}: Java parse error: " + " | ".join(relevant[:3])[:400]
+
+
+def _check_kotlin_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Best-effort Kotlin parse via `kotlinc -script-templates` is slow
+    and pulls heavy deps; we use brace-balance as the cheap signal here.
+
+    Kotlin's `'X'` is a Char literal so the JS-family brace-balancer would
+    miscount. Use a Kotlin-aware variant: treat ' as a Char delimiter (skips
+    exactly one char + closing quote) instead of toggling string mode.
+    """
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    counts = {"{": 0, "}": 0, "(": 0, ")": 0, "[": 0, "]": 0}
+    i, n = 0, len(source)
+    in_str: Optional[str] = None
+    in_line_comment = in_block_comment = False
+    while i < n:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_str is not None:
+            if ch == "\\" and nxt:
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch == "'":
+            # Char literal: skip the body up to next unescaped '
+            j = i + 1
+            while j < n and source[j] != "'":
+                if source[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                j += 1
+            i = j + 1
+            continue
+        if ch in ('"', "`"):
+            in_str = ch
+            i += 1
+            continue
+        if ch in counts:
+            counts[ch] += 1
+        i += 1
+    deltas = []
+    if counts["{"] != counts["}"]:
+        deltas.append(f"{{{counts['{']} vs }}{counts['}']}")
+    if counts["("] != counts[")"]:
+        deltas.append(f"({counts['(']} vs ){counts[')']}")
+    if counts["["] != counts["]"]:
+        deltas.append(f"[{counts['[']} vs ]{counts[']']}")
+    if not deltas:
+        return None
+    return f"{relative_path}: Kotlin brace imbalance ({', '.join(deltas)})"
+
+
+def _check_swift_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Best-effort Swift parse via `swiftc -parse`.
+
+    SWE-bench-style iOS / macOS tasks frequently lose on a single missing
+    semicolon-equivalent (`func` with trailing `,`, broken `guard let`, etc.).
+    `-parse` only parses; no type-check, no codegen, no module resolution —
+    so it returns quickly and won't drown the gate in unrelated SDK errors.
+    Silent skip when swiftc unavailable.
+    """
+    if not _has_executable("swiftc"):
+        return None
+    full = repo / relative_path
+    if not full.exists() or not full.is_file():
+        return None
+    try:
+        proc = subprocess.run(
+            ["swiftc", "-parse", "-suppress-warnings", str(full)],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=_SYNTAX_TIMEOUT,
+        )
+    except Exception:
+        return None
+    if proc.returncode == 0:
+        return None
+    err = (proc.stderr or "").strip()
+    if not err:
+        return None
+    skip_markers = ("could not build module", "no such module", "file not found")
+    relevant = [
+        line.strip() for line in err.splitlines()
+        if "error:" in line.lower()
+        and not any(s in line.lower() for s in skip_markers)
+    ]
+    if not relevant:
+        return None
+    return f"{relative_path}: Swift parse error: " + " | ".join(relevant[:3])[:400]
+
+
+def _check_yaml_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Stdlib-only YAML sanity check: balance markers and detect tab indentation
+    (YAML rejects tabs). PyYAML isn't stdlib so we skip a full parse.
+
+    Catches the common YAML pitfalls (tab indentation, unbalanced quotes, stray
+    `---` mid-document) without reaching for a third-party parser.
+    """
+    full = repo / relative_path
+    if not full.is_file():
+        return None
+    try:
+        text = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    issues: List[str] = []
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        # Tab indentation is invalid in YAML
+        if line.startswith("\t"):
+            issues.append(f"line {lineno}: tab-indentation (YAML requires spaces)")
+            break
+    # Quote balance per line (cheap heuristic, only on non-comment lines)
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        stripped = line.split("#", 1)[0]
+        if stripped.count('"') % 2 != 0:
+            issues.append(f"line {lineno}: unbalanced double quote")
+            break
+    if not issues:
+        return None
+    return f"{relative_path}: YAML sanity: " + ", ".join(issues[:2])
+
+
+def _check_toml_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    """TOML parse via stdlib `tomllib` (Python 3.11+). Cargo.toml /
+    pyproject.toml / railway.toml / fly.toml / netlify.toml all matter.
+    """
+    full = repo / relative_path
+    if not full.is_file():
+        return None
+    try:
+        import tomllib
+    except Exception:
+        return None
+    try:
+        with open(full, "rb") as fh:
+            tomllib.load(fh)
+        return None
+    except tomllib.TOMLDecodeError as exc:
+        return f"{relative_path}: TOML parse error: {str(exc)[:240]}"
+    except Exception:
+        return None
+
+
+def _check_shell_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
+    """`bash -n` parse check — no execution. Silent skip if bash unavailable.
+
+    Shell scripts ship as setup scripts in many SWE-bench tasks. Bash's
+    `-n` flag is the canonical parse-only check.
+    """
+    if not _has_executable("bash"):
+        return None
+    full = repo / relative_path
+    if not full.exists() or not full.is_file():
+        return None
+    try:
+        proc = subprocess.run(
+            ["bash", "-n", str(full)],
+            cwd=str(repo), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=_SYNTAX_TIMEOUT,
+        )
+    except Exception:
+        return None
+    if proc.returncode == 0:
+        return None
+    err = (proc.stderr or proc.stdout or "").strip()
+    if not err:
+        return None
+    relevant = [line.strip() for line in err.splitlines() if "error" in line.lower() or "syntax" in line.lower()][:3]
+    if not relevant:
+        return None
+    return f"{relative_path}: shell parse error: " + " | ".join(relevant)[:400]
+
+
+def _check_vue_sfc_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Vue SFC sanity: there should be at most one of each top-level block
+    (<template>, <script>, <script setup>, <style>). Component SFCs are
+    frequently malformed when the model duplicates a block during editing.
+    """
+    full = repo / relative_path
+    if not full.is_file():
+        return None
+    try:
+        text = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    issues: List[str] = []
+    template_count = len(re.findall(r"<template\b", text, re.IGNORECASE))
+    if template_count > 1:
+        issues.append(f"{template_count} `<template>` blocks (max 1)")
+    script_blocks = re.findall(r"<script\b[^>]*>", text, re.IGNORECASE)
+    setup_count = sum(1 for s in script_blocks if "setup" in s.lower())
+    plain_count = len(script_blocks) - setup_count
+    if setup_count > 1 or plain_count > 1:
+        issues.append(f"too many `<script>` blocks (setup={setup_count}, plain={plain_count})")
+    # Balance check on the SFC blocks themselves
+    for tag in ("template", "script", "style"):
+        opens = len(re.findall(rf"<{tag}\b[^>]*>", text, re.IGNORECASE))
+        closes = len(re.findall(rf"</{tag}\s*>", text, re.IGNORECASE))
+        if opens != closes:
+            issues.append(f"`<{tag}>` open/close imbalance ({opens}/{closes})")
+    if not issues:
+        return None
+    return f"{relative_path}: Vue SFC: " + ", ".join(issues[:3])
+
+
+def _check_svelte_sfc_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Svelte component sanity: at most one `<script>` block, at most one
+    `<style>` block; balanced opens/closes.
+    """
+    full = repo / relative_path
+    if not full.is_file():
+        return None
+    try:
+        text = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    issues: List[str] = []
+    for tag in ("script", "style"):
+        opens = len(re.findall(rf"<{tag}\b[^>]*>", text, re.IGNORECASE))
+        closes = len(re.findall(rf"</{tag}\s*>", text, re.IGNORECASE))
+        if opens > 1:
+            issues.append(f"{opens} `<{tag}>` blocks (max 1)")
+        if opens != closes:
+            issues.append(f"`<{tag}>` open/close imbalance ({opens}/{closes})")
+    if not issues:
+        return None
+    return f"{relative_path}: Svelte SFC: " + ", ".join(issues[:3])
+
+
+def _detect_binary_artifacts(patch: str) -> List[str]:
+    """Find diff blocks for binary build artifacts and cache files that
+    should never appear in a code-review diff. Scans `diff --git a/X b/X`
+    headers directly so it catches both the textual-diff form (with
+    `+++ b/path`) and git's `Binary files /dev/null and b/path differ`
+    form. Reviewers flag these as 'unrelated churn' and penalize the
+    patch even when the substantive work is correct.
+    """
+    if not patch.strip():
+        return []
+    seen: set = set()
+    out: List[str] = []
+    for line in patch.splitlines():
+        if not line.startswith("diff --git "):
+            continue
+        m = re.match(r"diff --git a/(.+?) b/(.+)$", line)
+        if not m:
+            continue
+        path = m.group(2).strip()
+        if path in seen:
+            continue
+        p_lower = path.lower()
+        if any(p_lower.endswith(ext) for ext in _BINARY_ARTIFACT_EXTS) \
+           or any(d in p_lower for d in _BINARY_ARTIFACT_DIRS):
+            seen.add(path)
+            out.append(path)
+    return out
+
+
+def _strip_binary_artifacts_from_patch(patch: str) -> str:
+    """Drop new-file blocks for binary artifacts / cache files. Never empties
+    the patch — returns the input unchanged if all blocks would be removed."""
+    artifacts = _detect_binary_artifacts(patch)
+    if not artifacts:
+        return patch
+    return _strip_empty_new_files_from_patch(patch, artifacts)
+
+
+def _autofix_drop_unsolicited_return_deletion_hunks(patch: str) -> str:
+    """Drop hunks that catastrophically delete a `return (...)` block without
+    adding a replacement. Sister to `_detect_unsolicited_return_block_deletion`:
+    when that detector fires post-finalize and refinement budget is exhausted,
+    this autofix surgically removes the bad hunks so the patch reverts to the
+    file's unchanged state for that region. Ships a partial-but-safe patch
+    instead of broken code that won't run.
+
+    Conservative: only drops the specific bad hunks; other hunks in the same
+    file (and other files) are left untouched. Returns the input unchanged
+    when no bad hunk is found.
+    """
+    if not patch.strip() or "diff --git " not in patch:
+        return patch
+    return_open_re = re.compile(r"^\s*return\s*\(\s*$")
+    return_any_re = re.compile(r"^\s*return\b")
+    blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+    changed = False
+    out_blocks: List[str] = []
+    for block in blocks:
+        if not block.startswith("diff --git "):
+            out_blocks.append(block)
+            continue
+        m = re.match(r"^diff --git a/(.+?) b/(.+?)$", block.split("\n", 1)[0])
+        if not m or not m.group(2).endswith(_JS_TS_FILE_SUFFIXES):
+            out_blocks.append(block)
+            continue
+        # Split into header + hunks; classify each hunk
+        hunks = re.split(r"(?=^@@ )", block, flags=re.MULTILINE)
+        header = hunks[0]
+        kept_hunks: List[str] = []
+        any_dropped = False
+        for hunk in hunks[1:]:
+            removed: List[str] = []
+            added: List[str] = []
+            for ln in hunk.splitlines()[1:]:
+                if ln.startswith("-") and not ln.startswith("---"):
+                    removed.append(ln[1:])
+                elif ln.startswith("+") and not ln.startswith("+++"):
+                    added.append(ln[1:])
+            bad = (
+                any(return_open_re.match(r) for r in removed)
+                and not any(return_any_re.search(a) for a in added)
+                and sum(1 for a in added if a.strip()) <= 1
+            )
+            if bad:
+                any_dropped = True
+                continue
+            kept_hunks.append(hunk)
+        if any_dropped:
+            changed = True
+            if kept_hunks:
+                out_blocks.append(header + "".join(kept_hunks))
+            # else: drop the whole file block (no hunks survived)
+        else:
+            out_blocks.append(block)
+    if not changed:
+        return patch
+    return "".join(out_blocks)
+
+
+def _autofix_inject_test_framework_imports(patch: str, repo: Optional[Path] = None) -> str:
+    """Inject explicit test-framework imports into new test files that use
+    `describe`/`it`/`expect` without an `import { ... } from 'vitest' |
+    '@jest/globals'` line — but ONLY when the project's existing test files
+    already follow this convention. Prevents pushing the model toward a
+    pattern that contradicts the project's actual style.
+
+    Conservative gates (ALL must hold):
+      - target file is a NEW test file (`new file mode` header)
+      - target file uses test globals (`describe`/`it`/`expect`)
+      - target file does not already import them
+      - `repo` is provided AND at least one existing test file in the repo
+        already imports from `'vitest'`/`'@jest/globals'` — confirming this
+        is the project's actual convention
+    Framework choice mirrors what existing test files use. Round-trips when
+    any gate fails.
+    """
+    if not patch.strip() or "diff --git " not in patch:
+        return patch
+    # Project-convention check: do existing test files use explicit imports?
+    project_uses_explicit = False
+    project_vitest = False
+    project_jest = False
+    if repo is not None:
+        try:
+            existing_tests = _sample_text(
+                repo,
+                ("*.test.ts", "*.test.tsx", "*.spec.ts", "*.spec.tsx", "*.test.js", "*.test.jsx"),
+                max_files=8,
+                max_bytes_per_file=15000,
+            )
+            if "from 'vitest'" in existing_tests or 'from "vitest"' in existing_tests:
+                project_vitest = True
+                project_uses_explicit = True
+            if "from '@jest/globals'" in existing_tests or 'from "@jest/globals"' in existing_tests:
+                project_jest = True
+                project_uses_explicit = True
+        except Exception:
+            pass
+    if not project_uses_explicit:
+        return patch
+    try:
+        blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+        out_blocks: List[str] = []
+        changed_any = False
+        for block in blocks:
+            if not block.startswith("diff --git ") or not block.strip():
+                out_blocks.append(block)
+                continue
+            fm = re.match(r"^diff --git a/([^\s]+) b/([^\s]+)", block)
+            if not fm or not _TEST_FILE_RE.search(fm.group(2)):
+                out_blocks.append(block)
+                continue
+            if not _NEW_FILE_HEADER_RE.search(block):
+                out_blocks.append(block)
+                continue
+            # Reconstruct added body to inspect usage + existing imports
+            body_added: List[str] = []
+            for ln in block.splitlines():
+                if ln.startswith("+") and not ln.startswith("+++"):
+                    body_added.append(ln[1:])
+            body_text = "\n".join(body_added)
+            if not _TEST_GLOBAL_USE_RE.search(body_text):
+                out_blocks.append(block)
+                continue
+            if _TEST_IMPORT_PRESENT_RE.search(body_text):
+                out_blocks.append(block)
+                continue
+            # Pick framework: prefer project-detected convention, fall back
+            # to in-body markers, then to vitest.
+            uses_vitest = any(mk in body_text for mk in _VITEST_MARKERS)
+            uses_jest = any(mk in body_text for mk in _JEST_MARKERS)
+            if project_vitest and not project_jest:
+                framework = "vitest"
+            elif project_jest and not project_vitest:
+                framework = "@jest/globals"
+            elif uses_jest and not uses_vitest:
+                framework = "@jest/globals"
+            else:
+                framework = "vitest"
+            # Pick imports based on what the body actually references
+            wanted: List[str] = []
+            for name in ("describe", "it", "test", "expect", "beforeEach", "afterEach", "beforeAll", "afterAll"):
+                if re.search(rf"\b{name}\s*\(", body_text):
+                    wanted.append(name)
+            if framework == "vitest" and re.search(r"\bvi\.", body_text):
+                wanted.append("vi")
+            if not wanted:
+                out_blocks.append(block)
+                continue
+            import_line = "import { " + ", ".join(wanted) + " } from '" + framework + "';"
+            # Inject as the FIRST added line after the @@ header
+            lines = block.splitlines()
+            inserted = False
+            new_lines: List[str] = []
+            for ln in lines:
+                new_lines.append(ln)
+                if not inserted and ln.startswith("@@"):
+                    # Insert injection AFTER the first @@ line
+                    new_lines.append("+" + import_line)
+                    new_lines.append("+")
+                    inserted = True
+            if inserted:
+                changed_any = True
+                # Repair the +N count in the @@ header to account for 2 added lines
+                repaired: List[str] = []
+                for ln in new_lines:
+                    if ln.startswith("@@"):
+                        m = re.match(r"^(@@\s+-\d+(?:,\d+)?\s+\+)(\d+)(?:,(\d+))?(\s+@@.*)$", ln)
+                        if m:
+                            start = m.group(2)
+                            count = int(m.group(3) or "1") + 2
+                            tail = m.group(4)
+                            repaired.append(f"{m.group(1)}{start},{count}{tail}")
+                            continue
+                    repaired.append(ln)
+                out_blocks.append("\n".join(repaired) + ("\n" if block.endswith("\n") else ""))
+            else:
+                out_blocks.append(block)
+        if not changed_any:
+            return patch
+        return "".join(out_blocks)
+    except Exception:
+        return patch
+
+
+def _autofix_rust_char_literal_strings(patch: str) -> str:
+    """Rewrite invalid Rust char literals (`'multi'`) to string literals
+    (`"multi"`) on added .rs lines. A char literal must contain exactly one
+    character; multi-character single-quoted forms like
+    `windows_subsystem = 'windows'` are compile errors. The fix is mechanical
+    and round-trips byte-for-byte when no such pattern is present.
+
+    Conservative: only edits added (`+`) lines in `.rs` files; skips lines
+    inside double-quoted strings (matched by trailing-double-quote count);
+    leaves lifetimes (`'a`) untouched because they have no closing quote.
+    """
+    if not patch.strip() or "diff --git " not in patch:
+        return patch
+    try:
+        blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+        out_blocks: List[str] = []
+        changed_any = False
+        for block in blocks:
+            if not block.startswith("diff --git ") or not block.strip():
+                out_blocks.append(block)
+                continue
+            fm = re.match(r"^diff --git a/([^\s]+) b/", block)
+            if not fm or not fm.group(1).endswith(".rs"):
+                out_blocks.append(block)
+                continue
+            new_lines: List[str] = []
+            block_changed = False
+            for ln in block.splitlines():
+                if not ln.startswith("+") or ln.startswith("+++"):
+                    new_lines.append(ln)
+                    continue
+                body = ln[1:]
+                # Strip line comments to avoid editing apostrophes inside `//`.
+                cidx = body.find("//")
+                head = body if cidx < 0 else body[:cidx]
+                tail = "" if cidx < 0 else body[cidx:]
+                rewritten = head
+                offset = 0
+                for m in _RUST_BAD_CHAR_LIT_LINE_RE.finditer(head):
+                    tok = m.group(1)
+                    # Skip if inside an unclosed `"..."` string
+                    pre = head[: m.start()]
+                    dq = 0
+                    i = 0
+                    while i < len(pre):
+                        if pre[i] == "\\" and i + 1 < len(pre):
+                            i += 2
+                            continue
+                        if pre[i] == '"':
+                            dq += 1
+                        i += 1
+                    if dq % 2 == 1:
+                        continue
+                    start = m.start() + offset
+                    end = m.end() + offset
+                    replacement = f'"{tok}"'
+                    rewritten = rewritten[:start] + replacement + rewritten[end:]
+                    offset += len(replacement) - (end - start)
+                new_body = rewritten + tail
+                if new_body != body:
+                    block_changed = True
+                    new_lines.append("+" + new_body)
+                else:
+                    new_lines.append(ln)
+            if block_changed:
+                changed_any = True
+                # Preserve trailing newline shape
+                out_blocks.append("\n".join(new_lines) + ("\n" if block.endswith("\n") else ""))
+            else:
+                out_blocks.append(block)
+        if not changed_any:
+            return patch
+        return "".join(out_blocks)
+    except Exception:
+        return patch
+
+
+def _detect_stack_summary(repo: Optional[Path]) -> str:
+    """Produce a short, factual stack/framework summary line by reading
+    manifest files at the repo root. Helps the inner LLM apply the right
+    idioms (NestJS DI, React hooks rules, Django ORM patterns, etc.).
+
+    Returns "" when no manifest is readable. Single short line; the model
+    consumes this alongside the existing _project_hint_block content.
+    """
+    if repo is None:
+        return ""
+    findings: List[str] = []
+    # package.json — most common
+    pkg = repo / "package.json"
+    if pkg.exists():
+        try:
+            data = json.loads(pkg.read_text(encoding="utf-8", errors="replace"))
+            deps = {}
+            for key in ("dependencies", "devDependencies", "peerDependencies"):
+                d = data.get(key)
+                if isinstance(d, dict):
+                    deps.update(d)
+            keys_lower = {k.lower(): k for k in deps}
+            frameworks = []
+            for marker, label in (
+                ("next", "Next.js"), ("nuxt", "Nuxt"), ("@nestjs/core", "NestJS"),
+                ("@angular/core", "Angular"), ("svelte", "Svelte"),
+                ("react", "React"), ("vue", "Vue"), ("express", "Express"),
+                ("fastify", "Fastify"), ("koa", "Koa"), ("hono", "Hono"),
+                ("@remix-run/react", "Remix"),
+            ):
+                if marker in keys_lower:
+                    frameworks.append(label)
+                    break
+            orms = []
+            for marker, label in (
+                ("typeorm", "TypeORM"), ("@prisma/client", "Prisma"),
+                ("sequelize", "Sequelize"), ("drizzle-orm", "Drizzle"),
+                ("mongoose", "Mongoose"),
+            ):
+                if marker in keys_lower:
+                    orms.append(label)
+                    break
+            testers = []
+            for marker, label in (
+                ("jest", "Jest"), ("vitest", "Vitest"),
+                ("mocha", "Mocha"), ("@playwright/test", "Playwright"),
+            ):
+                if marker in keys_lower:
+                    testers.append(label)
+                    break
+            if frameworks or orms or testers:
+                parts = []
+                if frameworks: parts.append(frameworks[0])
+                if orms: parts.append(orms[0])
+                if testers: parts.append(testers[0])
+                findings.append("Node.js stack: " + " + ".join(parts))
+        except Exception:
+            pass
+    # pyproject.toml / requirements.txt
+    py_manifest = None
+    for cand in ("pyproject.toml", "requirements.txt", "setup.py", "Pipfile"):
+        if (repo / cand).exists():
+            py_manifest = repo / cand
+            break
+    if py_manifest is not None:
+        try:
+            txt = py_manifest.read_text(encoding="utf-8", errors="replace").lower()
+            frameworks = []
+            for marker, label in (
+                ("django", "Django"), ("fastapi", "FastAPI"), ("flask", "Flask"),
+                ("starlette", "Starlette"), ("tornado", "Tornado"),
+                ("pyramid", "Pyramid"), ("aiohttp", "aiohttp"),
+            ):
+                if marker in txt:
+                    frameworks.append(label); break
+            testers = []
+            for marker, label in (("pytest", "pytest"), ("unittest", "unittest")):
+                if marker in txt:
+                    testers.append(label); break
+            parts = []
+            if frameworks: parts.append(frameworks[0])
+            if testers: parts.append(testers[0])
+            if parts:
+                findings.append("Python stack: " + " + ".join(parts))
+        except Exception:
+            pass
+    # Cargo.toml
+    cargo = repo / "Cargo.toml"
+    if cargo.exists():
+        findings.append("Rust crate (Cargo)")
+    # go.mod
+    if (repo / "go.mod").exists():
+        findings.append("Go module")
+    # pom.xml / build.gradle
+    if (repo / "pom.xml").exists():
+        findings.append("Maven (Java)")
+    elif (repo / "build.gradle").exists() or (repo / "build.gradle.kts").exists():
+        findings.append("Gradle (Java/Kotlin)")
+    # Ruby
+    if (repo / "Gemfile").exists():
+        findings.append("Ruby project (Gemfile)")
+    # PHP
+    if (repo / "composer.json").exists():
+        findings.append("PHP composer project")
+    return "; ".join(findings)[:240]
+
+
+def _detect_stack_idioms(repo: Optional[Path]) -> str:
+    """Return concrete framework-idiom hints for the inner LLM to apply.
+
+    Pairs with `_detect_stack_summary`: that one labels the stack ("Node.js
+    stack: NestJS + TypeORM + Jest"); this one expands each detected framework
+    into 1-3 sentences of canonical-pattern guidance (exception types, DI
+    style, hook rules, ORM patterns, etc.). The inner LLM uses these to
+    produce reference-aligned code instead of generic JS/Python.
+
+    Empty string when no recognized framework is detected. Capped at a
+    few-hundred chars per framework to keep the prompt compact.
+    """
+    if repo is None:
+        return ""
+    detected: List[str] = []
+    seen: set = set()
+
+    def mark(label: str) -> None:
+        if label in _FRAMEWORK_IDIOM_GUIDANCE and label not in seen:
+            seen.add(label)
+            detected.append(label)
+
+    pkg = repo / "package.json"
+    if pkg.exists():
+        try:
+            data = json.loads(pkg.read_text(encoding="utf-8", errors="replace"))
+            deps: Dict[str, Any] = {}
+            for key in ("dependencies", "devDependencies", "peerDependencies"):
+                d = data.get(key)
+                if isinstance(d, dict):
+                    deps.update(d)
+            keys_lower = {k.lower() for k in deps}
+            for marker, label in (
+                ("@nestjs/core", "NestJS"), ("next", "Next.js"),
+                ("@angular/core", "Angular"), ("nuxt", "Nuxt"),
+                ("svelte", "Svelte"), ("@remix-run/react", "Remix"),
+                ("react", "React"), ("vue", "Vue"),
+                ("solid-js", "SolidJS"), ("astro", "Astro"),
+                ("express", "Express"), ("fastify", "Fastify"),
+                ("typeorm", "TypeORM"), ("@prisma/client", "Prisma"),
+                ("mongoose", "Mongoose"), ("sequelize", "Sequelize"),
+                ("drizzle-orm", "Drizzle"),
+                ("@tauri-apps/api", "Tauri"), ("electron", "Electron"),
+                ("tailwindcss", "Tailwind CSS"),
+                ("@mui/material", "MUI"),
+                ("@supabase/supabase-js", "Supabase"),
+                ("firebase", "Firebase"),
+                ("convex", "Convex"),
+            ):
+                if marker in keys_lower:
+                    mark(label)
+        except Exception:
+            pass
+
+    py_manifest = None
+    for cand in ("pyproject.toml", "requirements.txt", "setup.py", "Pipfile"):
+        if (repo / cand).exists():
+            py_manifest = repo / cand
+            break
+    if py_manifest is not None:
+        try:
+            txt = py_manifest.read_text(encoding="utf-8", errors="replace").lower()
+            for marker, label in (
+                ("django", "Django"), ("fastapi", "FastAPI"),
+                ("flask", "Flask"), ("starlette", "Starlette"),
+            ):
+                if marker in txt:
+                    mark(label)
+        except Exception:
+            pass
+
+    # .NET — check for .csproj or .sln in repo root or solution-style layout.
+    has_csproj = False
+    try:
+        for p in repo.iterdir():
+            n = p.name.lower()
+            if n.endswith(".csproj") or n.endswith(".sln"):
+                has_csproj = True; break
+    except Exception:
+        pass
+    if has_csproj:
+        mark("ASP.NET Core")
+        mark("Entity Framework")
+
+    # Java / Kotlin
+    if (repo / "pom.xml").exists() or (repo / "build.gradle").exists() or (repo / "build.gradle.kts").exists():
+        try:
+            content = ""
+            for f in ("pom.xml", "build.gradle", "build.gradle.kts"):
+                p = repo / f
+                if p.exists():
+                    content += p.read_text(encoding="utf-8", errors="replace").lower()
+            if "spring-boot" in content or "springframework" in content:
+                mark("Spring Boot")
+        except Exception:
+            pass
+
+    # Ruby
+    gemfile = repo / "Gemfile"
+    if gemfile.exists():
+        try:
+            txt = gemfile.read_text(encoding="utf-8", errors="replace").lower()
+            if "rails" in txt:
+                mark("Rails")
+        except Exception:
+            pass
+
+    # PHP
+    composer = repo / "composer.json"
+    if composer.exists():
+        try:
+            txt = composer.read_text(encoding="utf-8", errors="replace").lower()
+            if "laravel/" in txt:
+                mark("Laravel")
+        except Exception:
+            pass
+
+    # Infra-as-code: surface whichever deployment scaffolds the repo already
+    # uses, so the model edits them with the canonical schema rather than
+    # generic key/value pairs.
+    try:
+        for f, label in (
+            ("Dockerfile", "Dockerfile"),
+            ("docker-compose.yml", "docker-compose"),
+            ("docker-compose.yaml", "docker-compose"),
+            ("compose.yml", "docker-compose"),
+            ("compose.yaml", "docker-compose"),
+            ("railway.toml", "Railway"),
+            ("railway.json", "Railway"),
+            ("render.yaml", "Render"),
+            ("fly.toml", "Fly.io"),
+            ("vercel.json", "Vercel"),
+            ("netlify.toml", "Netlify"),
+        ):
+            if (repo / f).exists():
+                mark(label)
+    except Exception:
+        pass
+
+    if not detected:
+        return ""
+    # Cap at 4 packs to keep the prompt block compact (raised from 3 to fit
+    # one infra pack alongside up to three framework packs).
+    parts = [f"- {label}: {_FRAMEWORK_IDIOM_GUIDANCE[label]}" for label in detected[:4]]
+    return "\n".join(parts)
+
+
+def _ecosystem_convention_hints(repo: Optional[Path]) -> str:
+    """Project-ecosystem convention hints surfaced based on the detected stack.
+
+    Each hint encodes a widely-published best practice for the framework
+    or test runner in question (RFC HTTP status semantics, React rules-of-
+    hooks, TypeScript style guide). Hints are stack-gated: TS conventions
+    only when package.json declares typescript, REST conventions only when
+    an HTTP framework is present, etc. Compact enough to ride alongside
+    the framework idiom block without bloating the system prompt.
+    """
+    if repo is None:
+        return ""
+    hints: List[str] = []
+    is_ts = False
+    is_next = False
+    is_react = False
+    is_express = False
+    is_vitest = False
+    is_jest = False
+    pkg = repo / "package.json"
+    if pkg.exists():
+        try:
+            data = json.loads(pkg.read_text(encoding="utf-8", errors="replace"))
+            deps: Dict[str, Any] = {}
+            for key in ("dependencies", "devDependencies", "peerDependencies"):
+                d = data.get(key)
+                if isinstance(d, dict):
+                    deps.update(d)
+            keys = {k.lower() for k in deps}
+            is_ts = "typescript" in keys or any(
+                (repo / p).exists() for p in ("tsconfig.json", "tsconfig.base.json")
+            )
+            is_next = "next" in keys
+            is_react = "react" in keys
+            is_express = "express" in keys or "fastify" in keys or "@fastify/express" in keys
+            is_vitest = "vitest" in keys
+            is_jest = "jest" in keys or "@types/jest" in keys
+        except Exception:
+            pass
+    # Sample the existing codebase to gate convention hints — only suggest a
+    # convention when the project already uses it. Prevents pushing the model
+    # toward a "best practice" that contradicts the project's actual style.
+    ts_sample = _sample_text(repo, ("*.ts", "*.tsx"), max_files=10, max_bytes_per_file=30000)
+    test_sample = _sample_text(repo, ("*.test.ts", "*.test.tsx", "*.spec.ts", "*.spec.tsx", "*.test.js"),
+                               max_files=6, max_bytes_per_file=20000)
+    if is_ts:
+        # Strict null hint only when codebase shows a meaningful presence of
+        # `=== null` / `!== null` already — confirms project convention.
+        strict_null_count = len(re.findall(r"===\s*null\b|!==\s*null\b", ts_sample))
+        loose_null_count = len(re.findall(r"if\s*\(\s*!\w[\w.]*\s*\)", ts_sample))
+        if strict_null_count >= 2 and strict_null_count >= loose_null_count:
+            hints.append(
+                "TS null checks: when a value is typed `T | null`, write the explicit "
+                "`x === null` / `x !== null` check rather than `if (!x)` — strict "
+                "equality avoids surprising coercion for `0`, `''`, and other falsy "
+                "non-null values."
+            )
+        # Interface hint only when codebase uses `interface` more than `type` aliases.
+        iface_count = len(re.findall(r"^\s*(?:export\s+)?interface\s+[A-Z]", ts_sample, re.MULTILINE))
+        type_alias_count = len(re.findall(r"^\s*(?:export\s+)?type\s+[A-Z]\w*\s*=\s*\{", ts_sample, re.MULTILINE))
+        if iface_count >= 2 and iface_count >= type_alias_count:
+            hints.append(
+                "TS object shapes: prefer `interface FooInput { ... }` for public "
+                "input/output object types (Input/Output/Dto/Schema/Payload/Request/"
+                "Response suffixes). Reserve `type` aliases for unions, mapped types, "
+                "and tuple aliases."
+            )
+    if is_express or is_next:
+        # HTTP status hint only if the codebase already has 201 usage somewhere
+        # — confirms RFC-strict convention vs always-200 style.
+        code_sample = _sample_text(repo, ("*.ts", "*.tsx", "*.js", "*.jsx"),
+                                   max_files=8, max_bytes_per_file=25000)
+        if re.search(r"\.status\s*\(\s*201\s*\)|res\.status\(201\)|StatusCodes\.CREATED", code_sample):
+            hints.append(
+                "HTTP status codes (RFC 7231): 201 for POST/PUT that creates a "
+                "resource, 200 for successful GET/PUT that updates, 204 for DELETE "
+                "with no body, 400 for client validation errors, 404 for not-found. "
+                "Returning 200 from a create route is technically incorrect."
+            )
+    if is_next:
+        # Server-only hint only if at least one existing file imports it.
+        server_only_sample = _sample_text(repo, ("*.ts", "*.tsx"),
+                                          max_files=20, max_bytes_per_file=10000)
+        if "'server-only'" in server_only_sample or '"server-only"' in server_only_sample:
+            hints.append(
+                "Next.js data layer: server-only data fetchers must `import "
+                "'server-only'` at the top so the bundler errors if a Client "
+                "Component imports them. Use the project's shared API helper "
+                "(e.g. `apiList`/`apiGet`) when one exists in `lib/`/`src/lib/`; "
+                "do not call raw `fetch(...)` from a new server module if a helper "
+                "is already established."
+            )
+    if is_vitest or is_jest:
+        framework = "vitest" if is_vitest else "@jest/globals"
+        # Only suggest explicit imports if the project already uses them.
+        framework_pattern = "from 'vitest'" if is_vitest else "from '@jest/globals'"
+        if framework_pattern in test_sample or framework_pattern.replace("'", '"') in test_sample:
+            hints.append(
+                f"Test imports: write explicit `import {{ describe, it, expect }} "
+                f"from '{framework}';` at the top of test files — the project "
+                "already follows this pattern, keep new tests consistent."
+            )
+    if is_react:
+        hints.append(
+            "React rules-of-hooks: every `useX()` call must be at the top level "
+            "of a component / custom hook — never inside `.map()`, `.filter()`, "
+            "conditionals, or loops. When per-item hook state is needed, extract "
+            "a small child component and use the hook there."
+        )
+    pkg_lock = repo / "package-lock.json"
+    yarn_lock = repo / "yarn.lock"
+    if pkg_lock.exists() or yarn_lock.exists() or pkg.exists():
+        hints.append(
+            "Package import paths: prefer the stable top-level entry point "
+            "(`firebase-functions/v1`, `@radix-ui/react-dialog`, `next/server`) "
+            "over deep internal paths (`firebase-functions/lib/...`, "
+            "`next/dist/...`). Deep internal paths often break across minor "
+            "version bumps."
+        )
+    # Always-on structural-faithfulness hint: preserve existing wrapper nesting.
+    hints.append(
+        "Preserve structural nesting: if a file has `<div class=\"relative\">"
+        "<div class=\"h-full\">` (or similar two-level wrappers), do NOT collapse "
+        "the wrappers into one when making targeted edits. Keep the existing "
+        "scaffolding intact — only the inner contents change. Collapsing "
+        "wrappers reads as unrelated restructuring."
+    )
+    # Always-on completeness hint: end-to-end wiring on multi-layer features.
+    hints.append(
+        "End-to-end wiring: when a task mentions a feature with multiple "
+        "layers (e.g. handler + helper + view, or schema + model + endpoint + "
+        "test), ensure EACH layer is updated. A patch that adds only the "
+        "helper without wiring the dispatch call, or only the schema without "
+        "the model, is treated as incomplete."
+    )
+    if not hints:
+        return ""
+    return "PROJECT ECOSYSTEM CONVENTIONS:\n  - " + "\n  - ".join(hints)
+
+
+def _modern_package_version_hint(repo: Optional[Path]) -> str:
+    """Surface the repo's OWN declared dependency pins as a version-band
+    reference. Self-updating from manifests; no hardcoded version list.
+
+    Reads package.json, pyproject.toml, or Cargo.toml in that priority and
+    returns up to 8 top-level pins. The model uses these as the canonical
+    version band when bumping or adding deps so its choices align with the
+    project's existing surface.
+    """
+    if repo is None:
+        return ""
+    pins: List[str] = []
+
+    pkg = repo / "package.json"
+    if pkg.is_file():
+        try:
+            data = json.loads(pkg.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(data, dict):
+                merged: Dict[str, str] = {}
+                for k in ("dependencies", "devDependencies", "peerDependencies"):
+                    d = data.get(k)
+                    if isinstance(d, dict):
+                        for name, ver in d.items():
+                            if isinstance(name, str) and isinstance(ver, str):
+                                merged.setdefault(name, ver)
+                for name, ver in list(merged.items())[:8]:
+                    pins.append(f"{name}@{ver}")
+        except Exception:
+            pass
+
+    if not pins:
+        pyproject = repo / "pyproject.toml"
+        if pyproject.is_file():
+            try:
+                text = pyproject.read_text(encoding="utf-8", errors="replace")
+                for m in list(re.finditer(
+                    r'^([a-zA-Z0-9_\-]+)\s*=\s*["\']([\^~>=<\d\.\*]+)["\']',
+                    text, re.MULTILINE,
+                ))[:8]:
+                    pins.append(f"{m.group(1)}@{m.group(2)}")
+            except Exception:
+                pass
+
+    if not pins:
+        cargo = repo / "Cargo.toml"
+        if cargo.is_file():
+            try:
+                text = cargo.read_text(encoding="utf-8", errors="replace")
+                in_deps = False
+                for line in text.splitlines():
+                    s = line.strip()
+                    if s.startswith("["):
+                        in_deps = s in ("[dependencies]", "[dev-dependencies]")
+                        continue
+                    if in_deps:
+                        m = re.match(r'^([a-zA-Z0-9_\-]+)\s*=\s*["\']([\d\.\*]+)["\']', s)
+                        if m and len(pins) < 8:
+                            pins.append(f"{m.group(1)}@{m.group(2)}")
+            except Exception:
+                pass
+
+    if not pins:
+        return ""
+    return (
+        "REPO DEPENDENCY PINS (anchor any version bumps to this band; do NOT "
+        "bump unless the task asks): " + ", ".join(pins)
+    )
+
+
+def _detect_off_convention_new_files(patch: str, repo: Optional[Path]) -> List[str]:
+    """For each new file the patch creates, check whether its parent directory
+    is invented (no sibling tracked files) AND a clear canonical location for
+    that file extension exists elsewhere in the repo.
+
+    Surfaced as an advisory hint — closes the `src/email-tool/foo.ts` vs
+    reference's `src/tools/email/foo.ts` class of alignment loss. Conservative:
+    only fires when the new file's parent has no existing siblings AND ≥40% of
+    same-extension tracked files cluster under a single different parent.
+    """
+    if repo is None or not patch.strip():
+        return []
+    try:
+        new_files = _patch_newly_created_files(patch)
+    except Exception:
+        return []
+    if not new_files:
+        return []
+    try:
+        tracked = set(_tracked_files(repo))
+    except Exception:
+        return []
+    if not tracked:
+        return []
+    from collections import Counter
+    findings: List[str] = []
+    for new_path in new_files[:8]:
+        p = Path(new_path)
+        suffix = p.suffix
+        parent_str = str(p.parent)
+        if not suffix or parent_str in {".", ""}:
+            continue
+        # If the parent dir already holds tracked files, the convention is real — leave it alone.
+        if any(t.startswith(parent_str + "/") for t in tracked):
+            continue
+        same_ext = [t for t in tracked if t.endswith(suffix)]
+        if len(same_ext) < 3:
+            continue
+        parent_counts = Counter(str(Path(t).parent) for t in same_ext)
+        most_common, hits = parent_counts.most_common(1)[0]
+        if most_common in {parent_str, ".", ""}:
+            continue
+        if hits < max(3, int(0.4 * len(same_ext))):
+            continue
+        suggested = str(Path(most_common) / p.name)
+        findings.append(
+            f"`{new_path}` at invented dir; "
+            f"{hits}/{len(same_ext)} `{suffix}` files live under `{most_common}/` — "
+            f"consider `{suggested}`"
+        )
+        if len(findings) >= 3:
+            break
+    return findings
+
+
+def _detect_package_json_deps_misplacement(patch: str) -> List[str]:
+    """Detect known runtime/build packages placed in `devDependencies` on a
+    package.json modification, when the deployment context implies build-on-server.
+
+    Conservative: only fires when a touched file is package.json AND the patch's
+    added lines actually move a known runtime package into the dev block (or a
+    dev-only tool into the runtime block).
+    """
+    if "package.json" not in patch:
+        return []
+    findings: List[str] = []
+    in_pkg_json = False
+    in_dev_block = False
+    in_runtime_block = False
+    brace_depth = 0
+    for raw in patch.splitlines():
+        if raw.startswith("+++ "):
+            path = raw[6:].strip() if raw.startswith("+++ b/") else raw[4:].strip()
+            in_pkg_json = path.endswith("package.json") or path.endswith("/package.json") or path == "package.json"
+            in_dev_block = in_runtime_block = False
+            brace_depth = 0
+            continue
+        if not in_pkg_json:
+            continue
+        if raw.startswith("@@"):
+            in_dev_block = in_runtime_block = False
+            brace_depth = 0
+            continue
+        if not (raw.startswith("+") or raw.startswith(" ")) or raw.startswith("+++"):
+            continue
+        line = raw[1:]
+        stripped = line.strip()
+        if '"devDependencies"' in stripped:
+            in_dev_block = True
+            in_runtime_block = False
+            brace_depth = 0
+            continue
+        if '"dependencies"' in stripped and "devDependencies" not in stripped:
+            in_runtime_block = True
+            in_dev_block = False
+            brace_depth = 0
+            continue
+        if "{" in stripped:
+            brace_depth += stripped.count("{")
+        if "}" in stripped:
+            brace_depth -= stripped.count("}")
+            if brace_depth <= 0:
+                in_dev_block = in_runtime_block = False
+        if not raw.startswith("+"):
+            continue
+        m = re.match(r'\s*"([@\w\-/.]+)"\s*:\s*"[^"]*"', stripped)
+        if not m:
+            continue
+        pkg = m.group(1)
+        if in_dev_block and pkg in _PKG_RUNTIME_BUILD_TOOLS:
+            findings.append(
+                f'package.json: `"{pkg}"` is in `devDependencies` but it is '
+                "needed at runtime/build on most server hosts (Railway, Render, "
+                "Fly, Vercel) — move it to `dependencies`."
+            )
+        elif in_runtime_block and pkg in _PKG_DEV_ONLY_TOOLS:
+            findings.append(
+                f'package.json: `"{pkg}"` is in `dependencies` but it is a '
+                "dev-only tool — move it to `devDependencies` to shrink the "
+                "production install footprint."
+            )
+        if len(findings) >= 4:
+            break
+    return findings
+
+
 def _parse_args(argv: List[str]) -> Dict[str, Any]:
     import argparse
 
