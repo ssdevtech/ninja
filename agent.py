@@ -1889,6 +1889,27 @@ def _normalize_score_map(scores: Dict[str, float]) -> Dict[str, float]:
 
 def _localization_query_terms(issue_text: str) -> List[str]:
     terms = list(_issue_terms(issue_text))
+
+    def _extend_path_terms(path_token: str) -> None:
+        path_token = path_token.strip()
+        if not path_token:
+            return
+        normalized = Path(path_token).as_posix()
+        if normalized not in terms:
+            terms.append(normalized)
+        for part in re.findall(r"[a-z0-9_]{3,}", normalized.lower()):
+            if part not in terms:
+                terms.append(part)
+        leaf = Path(normalized).name.lower()
+        stem = Path(normalized).stem.lower()
+        for part in (leaf, stem):
+            if len(part) >= 3 and part not in terms:
+                terms.append(part)
+
+    for mention in _extract_issue_path_mentions(issue_text)[:12]:
+        _extend_path_terms(mention)
+    for match in _SLASHED_PATH_RE.finditer(issue_text):
+        _extend_path_terms(match.group(1))
     for sym in _extract_issue_symbols(issue_text)[:16]:
         for part in re.findall(r"[a-z0-9_]{3,}", sym.lower()):
             if part not in terms:
@@ -2752,6 +2773,9 @@ def _extract_issue_case_block(issue_text: str, budget: int = _ISSUE_CASE_BLOCK_B
         seen.add(key)
         rendered.append((label, body))
 
+    for path in _extract_issue_path_mentions(issue_text)[:12]:
+        _add("path", path)
+
     fenced_spans: List[Tuple[int, int]] = []
     for m in _FENCED_CODE_RE.finditer(issue_text):
         fenced_spans.append(m.span())
@@ -2770,7 +2794,13 @@ def _extract_issue_case_block(issue_text: str, budget: int = _ISSUE_CASE_BLOCK_B
     lines = [header]
     used = len(header)
     for label, body in rendered:
-        block = f"#### {label}\n```\n{_truncate(body, 1600)}\n```"
+        prefix = f"#### {label}\n```\n"
+        suffix = "\n```"
+        available = budget - used - len(prefix) - len(suffix)
+        if available <= 0:
+            break
+        block_body = _truncate(body, min(1600, available))
+        block = f"{prefix}{block_body}{suffix}"
         if used + len(block) > budget:
             break
         lines.append(block)
@@ -2801,16 +2831,23 @@ def _build_acceptance_checkpoints_block(
     header = "### Acceptance checkpoints (verify each before <final>)"
     lines = [header]
     used = len(header)
+
+    scope = ""
+    if mentions:
+        unique_mentions = list(dict.fromkeys(mentions[:12]))
+        scope = "  file-scope: " + ", ".join(unique_mentions)
+    reserve_for_scope = len(scope) + 1 if scope and len(scope) + 1 <= budget else 0
+
     for i, c in enumerate(criteria[:_CRITERIA_MAX_BULLETS]):
         entry = f"  {i + 1}. {c}"
-        if used + len(entry) > budget:
+        if scope and used + len(entry) + reserve_for_scope > budget:
+            break
+        if not scope and used + len(entry) > budget:
             break
         lines.append(entry)
         used += len(entry)
-    if mentions:
-        scope = "  file-scope: " + ", ".join(mentions[:12])
-        if used + len(scope) <= budget:
-            lines.append(scope)
+    if scope and used + len(scope) <= budget:
+        lines.append(scope)
     if len(lines) == 1:
         return ""
     return "\n".join(lines)
@@ -3059,14 +3096,27 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
     if not tracked:
         return [], 0
 
+    issue_case = _extract_issue_case_block(issue)
     issue_lower = issue.lower()
+    issue_case_lower = issue_case.lower() if issue_case else ""
+    evidence_lower = issue_lower + ("\n" + issue_case_lower if issue_case_lower else "")
+
+    # The issue-case block preserves fenced code and traceback material, so mine
+    # its file mentions too.
     path_mentions = _extract_issue_path_mentions(issue)
+    if issue_case:
+        path_mentions.extend(_extract_issue_path_mentions(issue_case))
     mentioned: List[str] = []
     tracked_set = set(tracked)
+    seen_mentioned: set[str] = set()
     for mention in path_mentions:
-        normalized = mention.strip("./")
-        if normalized in tracked_set and _context_file_allowed(normalized):
+        normalized = mention.strip()
+        if normalized.startswith("./"):
+            normalized = normalized[2:]
+        normalized = normalized.lstrip("/")
+        if normalized in tracked_set and _context_file_allowed(normalized) and normalized not in seen_mentioned:
             mentioned.append(normalized)
+            seen_mentioned.add(normalized)
 
     # Backtick-wrapped identifiers in issues (e.g. `send-expiry-emails`,
     # `email_notificacoes`) are deliberate signals from the task author about
@@ -3075,7 +3125,6 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
     # mentions so they get the same +100 ranking boost as path-mentioned
     # files. Skipped when the identifier matches too many files (filters out
     # generic identifiers like `basic.py` or `any2txt`).
-    seen_mentioned = set(mentioned)
     for ident in set(_BACKTICK_IDENT_RE.findall(issue)):
         matches = [p for p in tracked_set if ident in p and _context_file_allowed(p)]
         if 1 <= len(matches) <= _BACKTICK_PATH_HITS_MAX:
@@ -3084,7 +3133,7 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
                     mentioned.append(m)
                     seen_mentioned.add(m)
 
-    terms = _issue_terms(issue)
+    terms = list(dict.fromkeys(_issue_terms(issue)))
     symbol_hits = _symbol_grep_hits(repo, tracked_set, issue)
     id_boost = _issue_identifier_path_boost(issue, list(tracked_set))
     err_boost = _issue_error_string_boost(repo, tracked_set, issue)
@@ -3101,11 +3150,11 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
         score = 0
         if relative_path in mentioned:
             score += 100
-        if path_lower in issue_lower:
+        if path_lower in evidence_lower:
             score += 35
-        if name_lower and name_lower in issue_lower:
+        if name_lower and name_lower in evidence_lower:
             score += 24
-        if stem_lower and len(stem_lower) >= 3 and stem_lower in issue_lower:
+        if stem_lower and len(stem_lower) >= 3 and stem_lower in evidence_lower:
             score += 16
         score += sum(int(3 * idf_weights.get(term, 1.0)) for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
@@ -3367,15 +3416,22 @@ def _extract_issue_path_mentions(issue: str) -> List[str]:
         re.IGNORECASE,
     )
     mentions: List[str] = []
-    for match in pattern.finditer(issue):
-        value = match.group(1).strip("`'\"()[]{}:,;")
-        if value and value not in mentions:
+    seen: set = set()
+
+    def _add(raw: str) -> None:
+        value = raw.strip("`'\"()[]{}:,;").strip()
+        if not value:
+            return
+        value = Path(value).as_posix()
+        if value not in seen:
+            seen.add(value)
             mentions.append(value)
+
+    for match in pattern.finditer(issue):
+        _add(match.group(1))
     basename_pattern = re.compile(r"(?<![\w./-])(" + "|".join(re.escape(name) for name in TEXT_FILE_BASENAMES) + r")(?![\w./-])")
     for match in basename_pattern.finditer(issue):
-        value = match.group(1).strip("`'\"()[]{}:,;")
-        if value and value not in mentions:
-            mentions.append(value)
+        _add(match.group(1))
     return mentions
 
 
@@ -9186,22 +9242,23 @@ _SYMBOL_STOP = {
 _DOTTED_PATH_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*){1,4})\b")
 _NAMESPACED_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*){1,4})\b")
 _DECORATOR_RE = re.compile(r"@([a-zA-Z_][a-zA-Z0-9_]{2,40})")
+_SLASHED_PATH_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_.-]*(?:/[A-Za-z_][A-Za-z0-9_.-]*){1,6})\b")
 
 
 def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[str]:
     """Pull identifier-shaped tokens from the issue text.
 
-    Heuristics now cover four token shapes:
+    Heuristics now cover five token shapes:
       - CamelCase / snake_case / lowercase ≥4-char identifiers (original)
+      - Slash-separated repository paths like ``src/utils/helpers.py``
       - Dotted module/attribute paths like ``foo.bar.baz`` (Python/JS modules,
         attribute chains the issue is naming explicitly)
       - Namespaced names like ``Foo::Bar`` (Rust / Ruby / C++ / Crystal)
       - Decorator references like ``@cache`` (Python / TS / Java annotations)
 
-    These additional shapes catch identifiers the base regex misses
-    (`from src.utils.helpers import foo` vs the issue mentioning
-    "src.utils.helpers"), and the new tokens flow through `_symbol_grep_hits`
-    so files referencing them get the same +60 path-boost as path mentions.
+    The slash-separated shape catches file paths the base regex misses, and
+    the new tokens flow through `_symbol_grep_hits` so files referencing them
+    get the same +60 path-boost as path mentions.
 
     Stop-words and very short tokens are filtered as before.
     """
@@ -9214,16 +9271,16 @@ def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[st
         lowered = token.lower()
         if lowered in _SYMBOL_STOP:
             return False
-        is_compound = any(c.isupper() for c in token[1:]) or "_" in token or "." in token or "::" in token
+        is_compound = any(c.isupper() for c in token[1:]) or "_" in token or "." in token or "::" in token or "/" in token or "-" in token
         if not is_compound and not allow_short and len(token) < 4:
             return False
         seen.add(token)
         out.append(token)
         return True
 
-    # Original single-token identifiers
-    for match in _SYMBOL_RE.finditer(issue_text):
-        if _accept(match.group(1)) and len(out) >= max_symbols:
+    # Slash-separated repository paths (`src/utils/helpers.py`)
+    for match in _SLASHED_PATH_RE.finditer(issue_text):
+        if _accept(match.group(1), allow_short=True) and len(out) >= max_symbols:
             return out
 
     # Dotted module/attribute paths (`foo.bar.baz`)
@@ -9238,6 +9295,11 @@ def _extract_issue_symbols(issue_text: str, *, max_symbols: int = 12) -> List[st
 
     # Decorator / annotation references (`@cache`, `@deprecated`)
     for match in _DECORATOR_RE.finditer(issue_text):
+        if _accept(match.group(1)) and len(out) >= max_symbols:
+            return out
+
+    # Original single-token identifiers
+    for match in _SYMBOL_RE.finditer(issue_text):
         if _accept(match.group(1)) and len(out) >= max_symbols:
             return out
 
