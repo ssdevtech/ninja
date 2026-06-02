@@ -12025,13 +12025,16 @@ def _select_better_salvage_candidate(
     winner_score: int,
     issue_text: str,
     salvage_pool: List[Tuple[str, str, int]],
+    repo: Optional[Path] = None,
 ) -> Optional[Tuple[str, str, int]]:
     """Best-of salvage selector — same logic as the prior dedup-extensions
     family, with wider trigger thresholds. When the winner is small on a
     multi-file issue, swap to a higher-quality salvage entry.
 
     Selection: candidate must have higher (file_coverage, line_count) than
-    the winner AND duel score within 5 points (no quality regression).
+    the winner AND duel score within a dynamic bounded score-delta (no quality regression).
+    Also includes a syntax-validity safety guard to ensure the alternative candidate
+    does not introduce syntax errors if the winner has none.
     """
     try:
         if not winner_patch or not salvage_pool:
@@ -12046,7 +12049,24 @@ def _select_better_salvage_candidate(
             return None
         winner_coverage = _patch_touches_files(winner_patch, issue_files)
         threshold = int(winner_lines * _SMARTPICK_ALTERNATIVE_LINE_RATIO)
-        score_floor = max(0, winner_score - 5)
+
+        # Bounded score-delta gate: tighter tolerance for high-scoring winner patches
+        if winner_score >= 85:
+            max_delta = 2
+        elif winner_score >= 70:
+            max_delta = 3
+        else:
+            max_delta = 5
+        score_floor = max(0, winner_score - max_delta)
+
+        # Precompute winner syntax errors if repo is available
+        winner_has_syntax_errors = False
+        if repo is not None:
+            try:
+                winner_has_syntax_errors = bool(_check_syntax(repo, winner_patch))
+            except Exception:
+                pass
+
         best: Optional[Tuple[str, str, int]] = None
         best_key = (winner_coverage, winner_lines)
         for label, patch, score in salvage_pool:
@@ -12060,6 +12080,13 @@ def _select_better_salvage_candidate(
             cov = _patch_touches_files(patch, issue_files)
             key = (cov, lines)
             if key > best_key:
+                # Syntax-validity safety guard: do not swap to a candidate with syntax errors if the winner is clean
+                if repo is not None and not winner_has_syntax_errors:
+                    try:
+                        if _check_syntax(repo, patch):
+                            continue
+                    except Exception:
+                        pass
                 best = (label, patch, score)
                 best_key = key
         return best
@@ -12745,8 +12772,42 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         try:
             patch_text = (result or {}).get("patch", "") or ""
             if patch_text.strip():
-                stripped = _strip_lockfile_diffs_unless_mentioned(patch_text, _issue_text)
-                if stripped != patch_text:
+                # Salvage swap / S3 scope-drop must run before linters: a swapped candidate
+                # otherwise skips dedupe/import autofixes and can ship duplicate imports.
+                try:
+                    _winner_score = _patch_duel_score(result["patch"], _issue_text)
+                    _better = _select_better_salvage_candidate(
+                        result["patch"], _winner_score, _issue_text, _salvage_pool,
+                        repo=_multishot_repo_obj,
+                    )
+                    if _better is not None:
+                        result["patch"] = _better[1]
+                        result["smartpick_swapped_to"] = _better[0]
+                except Exception:
+                    pass
+                # S3 MIXED-MODERATE: scope-creep DROP. Strip off-scope
+                # files from the winning patch if they contribute <= 20%
+                # of total added-lines (small surgical drops only).
+                # Run this second so that the stripped patch goes through all the cleanups/linters/autofixes.
+                try:
+                    _off_scope = _s3_detect_off_scope_files(result["patch"], _issue_text)
+                    if _off_scope:
+                        _total_added = _count_substantive_added_lines(result["patch"])
+                        if _total_added > 0:
+                            _off_added = sum(
+                                _s3_file_added_lines(result["patch"], p) for p in _off_scope
+                            )
+                            if _off_added > 0 and (_off_added / _total_added) <= _S3_SCOPE_DROP_MAX_RATIO:
+                                _stripped_off = _s3_drop_off_scope_blocks(
+                                    result["patch"], _off_scope
+                                )
+                                if _stripped_off and _stripped_off != result["patch"]:
+                                    result["patch"] = _stripped_off
+                                    result["s3_off_scope_dropped"] = _off_scope[:6]
+                except Exception:
+                    pass
+                stripped = _strip_lockfile_diffs_unless_mentioned(result["patch"], _issue_text)
+                if stripped != result["patch"]:
                     result["patch"] = stripped
                     result["lockfile_stripped"] = True
                 dropped = _drop_malformed_diff_blocks(result["patch"])
@@ -12842,36 +12903,11 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                         result["test_framework_imports_injected"] = True
                 except Exception:
                     pass
-                # Best-of salvage selector: under-produced winner on multi-
-                # file issue → swap to higher-coverage salvage candidate.
                 try:
-                    _winner_score = _patch_duel_score(result["patch"], _issue_text)
-                    _better = _select_better_salvage_candidate(
-                        result["patch"], _winner_score, _issue_text, _salvage_pool,
-                    )
-                    if _better is not None:
-                        result["patch"] = _better[1]
-                        result["smartpick_swapped_to"] = _better[0]
-                except Exception:
-                    pass
-                # S3 MIXED-MODERATE: scope-creep DROP. Strip off-scope
-                # files from the winning patch if they contribute <= 20%
-                # of total added-lines (small surgical drops only).
-                try:
-                    _off_scope = _s3_detect_off_scope_files(result["patch"], _issue_text)
-                    if _off_scope:
-                        _total_added = _count_substantive_added_lines(result["patch"])
-                        if _total_added > 0:
-                            _off_added = sum(
-                                _s3_file_added_lines(result["patch"], p) for p in _off_scope
-                            )
-                            if _off_added > 0 and (_off_added / _total_added) <= _S3_SCOPE_DROP_MAX_RATIO:
-                                _stripped_off = _s3_drop_off_scope_blocks(
-                                    result["patch"], _off_scope
-                                )
-                                if _stripped_off and _stripped_off != result["patch"]:
-                                    result["patch"] = _stripped_off
-                                    result["s3_off_scope_dropped"] = _off_scope[:6]
+                    _m10 = _autofix_react_namespace_imports(result["patch"], _multishot_repo_obj)
+                    if _m10 != result["patch"] and _m10.strip():
+                        result["patch"] = _m10
+                        result["react_namespace_imports_injected"] = True
                 except Exception:
                     pass
                 # PATCH-VALIDITY GUARD (must be LAST): transforms above can run
@@ -17084,6 +17120,97 @@ def _autofix_rust_char_literal_strings(patch: str) -> str:
         return patch
 
 
+def _inject_added_line_after_first_hunk(block: str, added_body: str) -> str:
+    """Insert one `+added_body` line immediately after the first `@@` hunk header
+    and bump that hunk's new-side line count so the patch stays well-formed."""
+    if not block.strip() or not added_body:
+        return block
+    lines = block.splitlines()
+    new_lines: List[str] = []
+    inserted = False
+    for ln in lines:
+        new_lines.append(ln)
+        if not inserted and ln.startswith("@@"):
+            new_lines.append("+" + added_body)
+            inserted = True
+    if not inserted:
+        return block
+    repaired: List[str] = []
+    for ln in new_lines:
+        if ln.startswith("@@"):
+            m = re.match(r"^(@@\s+-\d+(?:,\d+)?\s+\+)(\d+)(?:,(\d+))?(\s+@@.*)$", ln)
+            if m:
+                start = m.group(2)
+                count = int(m.group(3) or "1") + 1
+                repaired.append(f"{m.group(1)}{start},{count}{m.group(4)}")
+                continue
+        repaired.append(ln)
+    return "\n".join(repaired) + ("\n" if block.endswith("\n") else "")
+
+
+def _autofix_react_namespace_imports(patch: str, repo: Optional[Path] = None) -> str:
+    """Inject `import React from 'react';` when added JS/TS/JSX lines use `React.X`
+    without any React import in the hunk or on disk. Updates the first hunk's
+    `+count` so git apply does not reject the patch."""
+    if not patch.strip() or "diff --git " not in patch:
+        return patch
+    try:
+        blocks = re.split(r"(?=^diff --git )", patch, flags=re.MULTILINE)
+        out_blocks: List[str] = []
+        changed_any = False
+        for block in blocks:
+            if not block.startswith("diff --git ") or not block.strip():
+                out_blocks.append(block)
+                continue
+            fm = re.match(r"^diff --git a/([^\s]+) b/([^\s]+)", block)
+            if not fm:
+                out_blocks.append(block)
+                continue
+            filepath = fm.group(2)
+            if not filepath.endswith(_JS_LIKE_EXTS):
+                out_blocks.append(block)
+                continue
+            has_react_ns_use = False
+            has_react_import_in_patch = False
+            for ln in block.splitlines():
+                if ln.startswith("+") and not ln.startswith("+++"):
+                    if _REACT_NS_USE_RE.search(ln[1:]):
+                        has_react_ns_use = True
+                    if _REACT_IMPORT_RE.search(ln[1:]):
+                        has_react_import_in_patch = True
+                elif ln.startswith(" "):
+                    if _REACT_IMPORT_RE.search(ln[1:]):
+                        has_react_import_in_patch = True
+            if not has_react_ns_use or has_react_import_in_patch:
+                out_blocks.append(block)
+                continue
+            if repo is not None:
+                try:
+                    full_path = repo / filepath
+                    if full_path.is_file() and _REACT_IMPORT_RE.search(
+                        full_path.read_text(encoding="utf-8", errors="ignore")
+                    ):
+                        out_blocks.append(block)
+                        continue
+                except Exception:
+                    pass
+            rewritten = _inject_added_line_after_first_hunk(
+                block, "import React from 'react';"
+            )
+            if rewritten != block:
+                changed_any = True
+                out_blocks.append(rewritten)
+            else:
+                out_blocks.append(block)
+        if not changed_any:
+            return patch
+        merged = "".join(out_blocks)
+        repaired = _repair_hunk_header_counts(merged)
+        return repaired if _patch_well_formed(repaired) else merged
+    except Exception:
+        return patch
+
+
 def _detect_stack_summary(repo: Optional[Path]) -> str:
     """Produce a short, factual stack/framework summary line by reading
     manifest files at the repo root. Helps the inner LLM apply the right
@@ -17673,11 +17800,77 @@ def _detect_package_json_deps_misplacement(patch: str) -> List[str]:
     return findings
 
 
+def _agent_self_checks() -> None:
+    """Regression checks for finalize helpers (run: python agent.py --self-check)."""
+    sample_react_patch = (
+        "diff --git a/src/App.tsx b/src/App.tsx\n"
+        "--- a/src/App.tsx\n"
+        "+++ b/src/App.tsx\n"
+        "@@ -1,2 +1,3 @@\n"
+        " \n"
+        "+export const App: React.FC = () => null;\n"
+    )
+    fixed = _autofix_react_namespace_imports(sample_react_patch, None)
+    if "+import React from 'react';" not in fixed:
+        raise AssertionError("react namespace autofix must inject React import")
+    if not _patch_well_formed(fixed):
+        raise AssertionError("react namespace autofix must emit a well-formed patch")
+
+    already_imported = (
+        "diff --git a/src/App.tsx b/src/App.tsx\n"
+        "--- a/src/App.tsx\n"
+        "+++ b/src/App.tsx\n"
+        "@@ -1,3 +1,4 @@\n"
+        "+import React from 'react';\n"
+        "+export const App: React.FC = () => null;\n"
+    )
+    noop = _autofix_react_namespace_imports(already_imported, None)
+    if noop.count("+import React from 'react';") != 1:
+        raise AssertionError("react namespace autofix must not double-inject import")
+
+    salvage_with_dupes = (
+        "diff --git a/src/a.ts b/src/a.ts\n"
+        "--- a/src/a.ts\n"
+        "+++ b/src/a.ts\n"
+        "@@ -0,0 +1,4 @@\n"
+        "+import { foo } from 'bar';\n"
+        "+import { foo } from 'bar';\n"
+        "+import { baz } from 'qux';\n"
+        "+export const x = 1;\n"
+    )
+    deduped_after_swap = _dedupe_duplicate_imports(salvage_with_dupes)
+    added_foo = sum(
+        1
+        for ln in deduped_after_swap.splitlines()
+        if ln.startswith("+") and "import { foo }" in ln
+    )
+    if added_foo != 1:
+        raise AssertionError(
+            "post-salvage dedupe must collapse duplicate added import lines"
+        )
+
+    hunk_block = (
+        "diff --git a/x.ts b/x.ts\n"
+        "--- a/x.ts\n"
+        "+++ b/x.ts\n"
+        "@@ -0,0 +1,1 @@\n"
+        "+const a = 1;\n"
+    )
+    injected = _inject_added_line_after_first_hunk(hunk_block, "import React from 'react';")
+    if not _patch_well_formed(injected):
+        raise AssertionError("_inject_added_line_after_first_hunk must preserve hunk counts")
+
+
 def _parse_args(argv: List[str]) -> Dict[str, Any]:
     import argparse
 
     parser = argparse.ArgumentParser(description="Run portable single-file coding agent.")
-    parser.add_argument("--repo", required=True, help="Path to repo/task directory.")
+    parser.add_argument(
+        "--self-check",
+        action="store_true",
+        help="Run built-in regression checks and exit.",
+    )
+    parser.add_argument("--repo", required=False, help="Path to repo/task directory.")
     parser.add_argument("--issue", required=False, help="Issue text.")
     parser.add_argument("--issue-file", required=False, help="File containing issue text.")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Model name.")
@@ -17693,9 +17886,18 @@ def _parse_args(argv: List[str]) -> Dict[str, Any]:
 def main(argv: List[str]) -> int:
     args = _parse_args(argv)
 
+    if args.get("self_check"):
+        _agent_self_checks()
+        print(json.dumps({"self_check": "passed"}, indent=2))
+        return 0
+
     issue = args.get("issue") or ""
     if args.get("issue_file"):
         issue = Path(args["issue_file"]).read_text(encoding="utf-8")
+
+    if not (args.get("repo") or "").strip():
+        print("ERROR: provide --repo (or use --self-check)", file=sys.stderr)
+        return 2
 
     if not issue.strip():
         print("ERROR: provide --issue or --issue-file", file=sys.stderr)
