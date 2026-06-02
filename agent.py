@@ -6358,6 +6358,11 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
         lambda: _detect_off_convention_new_files(patch, repo),
         lambda: _detect_package_json_deps_misplacement(patch),
         lambda: _detect_removed_public_symbols_still_used(patch, repo),
+        # --- Additional correctness detectors ---
+        lambda: _detect_python_correctness_traps(repo, patch),
+        lambda: _detect_type_only_import_as_value(repo, patch),
+        lambda: _detect_jsx_fragment_imbalance(patch, repo),
+        lambda: _detect_php_duplicate_method(repo, patch),
     ):
         try:
             errors.extend(_detector_call())
@@ -16396,6 +16401,628 @@ def _check_ts_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
     if not relevant:
         return None
     return f"{relative_path}: {relevant[0]}"
+
+
+# -----------------------------------------------------------------------------
+# Correctness detectors (pure-stdlib, deterministic).
+# These flag a small set of high-confidence correctness bugs in the patch's
+# added lines (mutable default arguments, builtin-exception shadowing, and
+# type-only imports instantiated as values). They run inside _check_syntax and,
+# on a hit, route through the existing syntax-fix refinement turn — no new model
+# turn, no new solve attempt. Each check is tightened for near-zero false
+# positives so a healthy patch is never sent back for a needless refinement.
+# -----------------------------------------------------------------------------
+
+def _added_newfile_linenos_by_file(patch: str) -> "Dict[str, set]":
+    """Map each b/ path -> set of NEW-FILE line numbers the patch ADDS.
+
+    Parses unified-diff hunk headers (@@ -a,b +c,d @@) and tracks the new-file
+    line counter: context and '+' lines advance it; '-' lines do not. Returns
+    the post-patch line numbers of '+' lines. Deterministic, pure-stdlib. Lets
+    AST-based checks fire ONLY on code the patch actually introduced.
+    """
+    out: Dict[str, set] = {}
+    cur: Optional[str] = None
+    newno = 0
+    for line in patch.splitlines():
+        m = re.match(r"^diff --git a/.+? b/(.+)$", line)
+        if m:
+            cur = m.group(1)
+            out.setdefault(cur, set())
+            newno = 0
+            continue
+        if cur is None:
+            continue
+        hh = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+        if hh:
+            newno = int(hh.group(1))
+            continue
+        if line.startswith("+++") or line.startswith("---") or line.startswith("\\"):
+            continue
+        if line.startswith("+"):
+            out[cur].add(newno)
+            newno += 1
+        elif line.startswith("-"):
+            continue
+        else:
+            # context line (leading ' ') or a blank context line emitted as ''
+            newno += 1
+    return out
+
+
+# Curated, near-zero-FP set: builtin EXCEPTION types whose shadowing by an added
+# binding is essentially always a bug (a later `except X` / `raise X` then
+# resolves to the local, not the exception). Deliberately EXCLUDES ambiguous
+# builtins like list/dict/id/type/input that are legitimately used as locals.
+_SHADOW_BUILTIN_EXCEPTIONS = frozenset({
+    "FileNotFoundError", "FileExistsError", "NotADirectoryError",
+    "IsADirectoryError", "PermissionError", "NotImplementedError",
+    "ValueError", "KeyError", "IndexError", "TypeError", "AttributeError",
+    "RuntimeError", "StopIteration", "OSError", "IOError", "ImportError",
+    "ModuleNotFoundError", "ConnectionError", "TimeoutError", "LookupError",
+})
+
+
+def _scope_direct_nodes(scope: Any):
+    """Yield AST nodes lexically inside `scope` (Module or FunctionDef) WITHOUT
+    descending into nested function/class/lambda scopes, which introduce their
+    own name bindings. Used to keep shadow detection scope-correct."""
+    import ast as _ast
+    stack = list(getattr(scope, "body", []))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef,
+                             _ast.ClassDef, _ast.Lambda)):
+            # nested scope: yield the node itself but do not descend into it.
+            continue
+        for child in _ast.iter_child_nodes(node):
+            stack.append(child)
+
+
+def _detect_python_correctness_traps(repo: Path, patch: str) -> List[str]:
+    """Two near-zero-FP Python traps introduced by the patch's ADDED lines:
+
+      (a) mutable default argument: ``def f(x=[])`` / ``{}`` / ``set()`` literal
+          default — Python evaluates the default once and shares the mutable
+          object across calls. Flagged only when the def signature line is added.
+      (b) builtin-EXCEPTION shadowing: an added binding rebinds a builtin
+          exception name AND that name is later used in a raise/except/call
+          position — the use silently resolves to the local, not the exception.
+
+    AST-based, deterministic, no model call, no extra solve attempt. Returns
+    error strings consumed by build_syntax_fix_prompt.
+    """
+    import ast as _ast
+    added = _added_newfile_linenos_by_file(patch)
+    out: List[str] = []
+    for rel in _patch_changed_files(patch):
+        if Path(rel).suffix.lower() != ".py":
+            continue
+        added_lines = added.get(rel) or set()
+        if not added_lines:
+            continue
+        full = (repo / rel).resolve()
+        try:
+            full.relative_to(repo.resolve())
+        except (ValueError, RuntimeError):
+            continue
+        if not full.exists():
+            continue
+        try:
+            source = full.read_text(encoding="utf-8", errors="replace")
+            tree = _ast.parse(source)
+        except Exception:
+            # Unparseable -> _check_python_syntax_one already handles it.
+            continue
+        file_findings = 0
+        # (a) mutable default arguments on ADDED def lines.
+        for node in _ast.walk(tree):
+            if file_findings >= 3:
+                break
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                if getattr(node, "lineno", -1) not in added_lines:
+                    continue
+                defaults = list(node.args.defaults) + [
+                    d for d in node.args.kw_defaults if d is not None
+                ]
+                for d in defaults:
+                    if isinstance(d, (_ast.List, _ast.Dict, _ast.Set)):
+                        kind = type(d).__name__.lower()
+                        out.append(
+                            f"{rel}: function '{node.name}' has a mutable default "
+                            f"argument (a {kind} literal). Python evaluates the default "
+                            f"once and shares it across calls; default to None and build "
+                            f"the {kind} inside the body."
+                        )
+                        file_findings += 1
+                        break
+        # (b) builtin-exception shadowing introduced on an added line AND used in
+        #     the SAME lexical scope. Scope-aware: a rebind local to one function
+        #     does not shadow a use in another function, so we never flag across
+        #     scopes (avoids a class of false positives).
+        if file_findings < 3:
+            scopes = [tree]
+            for node in _ast.walk(tree):
+                if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                    scopes.append(node)
+            for scope in scopes:
+                if file_findings >= 3:
+                    break
+                rebound: Dict[str, int] = {}
+                used: set = set()
+                for node in _scope_direct_nodes(scope):
+                    if isinstance(node, _ast.Assign):
+                        for t in node.targets:
+                            if (isinstance(t, _ast.Name) and t.id in _SHADOW_BUILTIN_EXCEPTIONS
+                                    and getattr(node, "lineno", -1) in added_lines):
+                                rebound.setdefault(t.id, node.lineno)
+                    elif isinstance(node, _ast.Raise):
+                        for sub in _ast.walk(node):
+                            if isinstance(sub, _ast.Name) and sub.id in _SHADOW_BUILTIN_EXCEPTIONS:
+                                used.add(sub.id)
+                    elif isinstance(node, _ast.ExceptHandler) and node.type is not None:
+                        for sub in _ast.walk(node.type):
+                            if isinstance(sub, _ast.Name) and sub.id in _SHADOW_BUILTIN_EXCEPTIONS:
+                                used.add(sub.id)
+                    # NOTE: a plain Call of the name (e.g. ValueError('msg')) is
+                    # deliberately NOT treated as a use — a locally rebound name
+                    # used purely as a callable factory is a legitimate pattern.
+                    # We only flag a raise/except use, where resolving to a non-
+                    # exception local is an actual runtime bug.
+                for nm in sorted(set(rebound) & used):
+                    if file_findings >= 3:
+                        break
+                    out.append(
+                        f"{rel}: added code rebinds the builtin exception '{nm}', and "
+                        f"'{nm}' is used in a raise/except in the same scope — that use "
+                        f"resolves to the local binding, not the builtin exception. Rename the local."
+                    )
+                    file_findings += 1
+    return out[:8]
+
+
+def _detect_type_only_import_as_value(repo: Path, patch: str) -> List[str]:
+    """A TS/TSX symbol imported as TYPE-ONLY then INSTANTIATED on an added line.
+
+    A type-only import (``import type { X }`` or ``import { type X }``) is erased
+    at compile time, so ``new X(`` against it is a guaranteed TS error. Restricted
+    to the ``new X(`` instantiation form (unambiguous, near-zero FP) and skips any
+    symbol that is ALSO value-imported in the same added lines.
+    """
+    added = _patch_added_lines_by_file(patch)
+    out: List[str] = []
+    type_import_re = re.compile(r"^\s*import\s+type\s*\{([^}]*)\}")
+    plain_import_re = re.compile(r"^\s*import\s*(?:type\s*)?\{([^}]*)\}")
+    # Local declarations that would SHADOW a same-named type-only import, making
+    # `new X(` resolve to the local value, not the erased type import.
+    local_bind_re = re.compile(
+        r"^\s*(?:export\s+(?:default\s+)?)?(?:abstract\s+)?"
+        r"(?:const|let|var|class|function\*?|enum|namespace|interface|type)\s+"
+        r"([A-Za-z_$][\w$]*)"
+    )
+    for rel in _patch_changed_files(patch):
+        if Path(rel).suffix.lower() not in {".ts", ".tsx", ".mts", ".cts"}:
+            continue
+        bodies = added.get(rel) or []
+        if not bodies:
+            continue
+        type_syms: set = set()
+        value_syms: set = set()
+        local_defs: set = set()
+        for line in bodies:
+            tm = type_import_re.match(line)
+            if tm:
+                for part in tm.group(1).split(","):
+                    name = part.strip().split(" as ")[-1].strip()
+                    if re.fullmatch(r"[A-Za-z_$][\w$]*", name or ""):
+                        type_syms.add(name)
+                continue
+            pm = plain_import_re.match(line)
+            if pm:
+                for part in pm.group(1).split(","):
+                    p = part.strip()
+                    inline_type = p.startswith("type ")
+                    name = p.split(" as ")[-1].strip()
+                    if inline_type:
+                        name = p[5:].split(" as ")[-1].strip()
+                    if re.fullmatch(r"[A-Za-z_$][\w$]*", name or ""):
+                        (type_syms if inline_type else value_syms).add(name)
+                continue
+            lm = local_bind_re.match(line)
+            if lm:
+                local_defs.add(lm.group(1))
+        type_syms -= value_syms   # a symbol also value-imported is fine
+        type_syms -= local_defs   # a symbol locally redefined shadows the type import
+        if not type_syms:
+            continue
+        findings = 0
+        for line in bodies:
+            if findings >= 3:
+                break
+            for sym in sorted(type_syms):
+                if re.search(r"\bnew\s+" + re.escape(sym) + r"\s*\(", line):
+                    out.append(
+                        f"{rel}: '{sym}' is a type-only import but is instantiated with "
+                        f"'new {sym}(' on an added line. Type-only imports are erased at "
+                        f"compile time; import '{sym}' as a value (drop the `type` modifier) "
+                        f"or remove the runtime use."
+                    )
+                    findings += 1
+                    break
+    return out[:8]
+
+
+def _patch_context_lines_by_file(patch: str) -> "Dict[str, List[str]]":
+    """Map each b/ path -> list of UNCHANGED context line bodies (space-prefixed
+    lines of a unified diff, leading ' ' stripped). Lets a fragment-balance check
+    count a matching token that lives on an unchanged context line."""
+    out: Dict[str, List[str]] = {}
+    cur: Optional[str] = None
+    for line in patch.splitlines():
+        m = re.match(r"^diff --git a/.+? b/(.+)$", line)
+        if m:
+            cur = m.group(1)
+            out.setdefault(cur, [])
+            continue
+        if cur is None:
+            continue
+        if line.startswith("+++") or line.startswith("---") or line.startswith("@@"):
+            continue
+        if line.startswith(" "):
+            out[cur].append(line[1:])
+    return out
+
+
+def _mask_js_tokens_for_scan(text: str) -> str:
+    """Blank out string/template literals and comments in a JS/TS blob so that
+    tokens surviving ONLY inside a string/comment/template are not counted.
+    Replaces masked spans with spaces (offsets preserved). Best-effort; never
+    raises."""
+    try:
+        out: List[str] = []
+        i = 0
+        n = len(text)
+        in_str: Optional[str] = None
+        in_line_comment = False
+        in_block_comment = False
+        last_sig = ""  # last significant (non-space) char in value context
+        # A `/` starts a regex literal (not division) when the previous
+        # significant char is empty/start or an operator/punctuator. Treating an
+        # ambiguous `/` as a regex (masking more) is the safe direction here.
+        # NOTE: '<' is deliberately excluded — the '/' in a JSX close tag
+        # (</div>, </>) always follows '<' and must NOT be read as a regex start.
+        regex_prefix = set("({[,;:=!&|?+-*%^~>}") | {""}
+        while i < n:
+            ch = text[i]
+            nxt = text[i + 1] if i + 1 < n else ""
+            if in_line_comment:
+                if ch == "\n":
+                    in_line_comment = False
+                    out.append(ch)
+                else:
+                    out.append(" ")
+                i += 1
+                continue
+            if in_block_comment:
+                if ch == "*" and nxt == "/":
+                    in_block_comment = False
+                    out.append("  ")
+                    i += 2
+                    continue
+                out.append("\n" if ch == "\n" else " ")
+                i += 1
+                continue
+            if in_str is not None:
+                if ch == "\\" and nxt:
+                    out.append("  ")
+                    i += 2
+                    continue
+                if ch == in_str:
+                    in_str = None
+                    last_sig = "x"  # string result is an operand
+                out.append("\n" if ch == "\n" else " ")
+                i += 1
+                continue
+            if ch == "/" and nxt == "/":
+                in_line_comment = True
+                out.append("  ")
+                i += 2
+                continue
+            if ch == "/" and nxt == "*":
+                in_block_comment = True
+                out.append("  ")
+                i += 2
+                continue
+            if ch == "/" and last_sig in regex_prefix:
+                # regex literal: blank its contents, honouring \-escapes and
+                # [...] char classes (where '/' does not terminate).
+                out.append(" ")
+                i += 1
+                in_class = False
+                while i < n:
+                    c = text[i]
+                    if c == "\\" and i + 1 < n:
+                        out.append("  ")
+                        i += 2
+                        continue
+                    if c == "[":
+                        in_class = True
+                    elif c == "]":
+                        in_class = False
+                    elif c == "/" and not in_class:
+                        out.append(" ")
+                        i += 1
+                        break
+                    elif c == "\n":
+                        # unterminated regex on this line; stop to stay safe
+                        break
+                    out.append("\n" if c == "\n" else " ")
+                    i += 1
+                last_sig = "x"
+                continue
+            if ch in ('"', "'", "`"):
+                in_str = ch
+                out.append(" ")
+                i += 1
+                continue
+            out.append(ch)
+            if not ch.isspace():
+                last_sig = ch
+            i += 1
+        return "".join(out)
+    except Exception:
+        return text
+
+
+# Unambiguous React fragment tokens. The OPEN token is `<>` (empty JSX tag) and
+# the CLOSE token is `</>`. Unlike `<Tag>`/`</Tag>` these never collide with TS
+# generics (`Array<string>`) or numeric comparison (`a < b`), so counting them
+# for balance is safe.
+_JSX_FRAGMENT_OPEN_RE = re.compile(r"<>")
+_JSX_FRAGMENT_CLOSE_RE = re.compile(r"</>")
+
+
+def _detect_jsx_fragment_imbalance(patch: str, repo: Optional[Path] = None) -> List[str]:
+    """Flag a net React-fragment imbalance in a touched .jsx/.tsx file. Counts
+    ONLY the unambiguous empty-tag fragment tokens `<>` (open) and `</>` (close)
+    — never arbitrary `<Tag>` balance, which TS generics/comparisons would make
+    ambiguous. An unclosed `<>` or a stray `</>` is a JSX parse error.
+
+    Balances over the FULL POST-PATCH FILE (read from the repo working tree the
+    detectors already see); falls back to ADDED + CONTEXT hunk lines when the
+    repo is unavailable, so a matching token on an unchanged context line still
+    counts (no partial-hunk false positive). High precision: the imbalance must
+    survive BOTH a raw count and a string/template/comment-masked count with the
+    same nonzero delta — any disagreement bails to NO finding. Deterministic;
+    stdlib only; never raises.
+    """
+    findings: List[str] = []
+    try:
+        added_by_file = _patch_added_lines_by_file(patch)
+        ctx_by_file = _patch_context_lines_by_file(patch)
+        for rel in _patch_changed_files(patch):
+            if len(findings) >= 3:
+                break
+            if Path(rel).suffix.lower() not in {".jsx", ".tsx"}:
+                continue
+            added = added_by_file.get(rel) or []
+            if not added:
+                continue
+            added_blob = "\n".join(added)
+            if (len(_JSX_FRAGMENT_OPEN_RE.findall(added_blob)) == 0
+                    and len(_JSX_FRAGMENT_CLOSE_RE.findall(added_blob)) == 0):
+                continue
+            blob = None
+            if repo is not None:
+                try:
+                    full = (repo / rel).resolve()
+                    full.relative_to(repo.resolve())
+                    if full.exists():
+                        blob = full.read_text(encoding="utf-8", errors="replace")
+                except (ValueError, RuntimeError):
+                    blob = None
+                except Exception:
+                    blob = None
+            if blob is None:
+                ctx = ctx_by_file.get(rel) or []
+                blob = "\n".join(added + ctx)
+            raw_open = len(_JSX_FRAGMENT_OPEN_RE.findall(blob))
+            raw_close = len(_JSX_FRAGMENT_CLOSE_RE.findall(blob))
+            if raw_open == 0 and raw_close == 0:
+                continue
+            masked = _mask_js_tokens_for_scan(blob)
+            m_open = len(_JSX_FRAGMENT_OPEN_RE.findall(masked))
+            m_close = len(_JSX_FRAGMENT_CLOSE_RE.findall(masked))
+            raw_delta = raw_open - raw_close
+            m_delta = m_open - m_close
+            if m_delta == 0 or raw_delta != m_delta:
+                continue
+            if m_delta > 0:
+                msg = (
+                    f"{rel}: post-patch file opens {m_open} React fragment(s) `<>` "
+                    f"but closes only {m_close} `</>` (net {m_delta:+d}). An unclosed "
+                    f"`<>` fragment is a JSX parse error. Add the matching `</>` "
+                    f"close-fragment token(s) at the correct nesting level; do not "
+                    f"change any other markup."
+                )
+            else:
+                msg = (
+                    f"{rel}: post-patch file contains {m_close} React close-fragment "
+                    f"token(s) `</>` but only {m_open} open-fragment `<>` (net "
+                    f"{m_delta:+d}). A stray `</>` with no matching `<>` is a JSX parse "
+                    f"error. Remove the extra `</>` token(s); do not change any other "
+                    f"markup."
+                )
+            findings.append(msg)
+    except Exception:
+        return findings[:3]
+    return findings[:3]
+
+
+_PHP_DUP_SUFFIXES = {".php", ".phtml"}
+
+
+def _mask_php_tokens(text: str) -> str:
+    """Blank PHP string literals ('...', \"...\") and comments (//, #, /* */) with
+    spaces (offsets/newlines preserved) so a 'function'/'class' keyword living in
+    a string or comment is not mis-counted. Heredoc/nowdoc not handled (rare);
+    best-effort, never raises."""
+    try:
+        out: List[str] = []
+        i = 0
+        n = len(text)
+        in_str: Optional[str] = None
+        in_line_comment = False
+        in_block_comment = False
+        while i < n:
+            ch = text[i]
+            nxt = text[i + 1] if i + 1 < n else ""
+            if in_line_comment:
+                if ch == "\n":
+                    in_line_comment = False
+                    out.append(ch)
+                else:
+                    out.append(" ")
+                i += 1
+                continue
+            if in_block_comment:
+                if ch == "*" and nxt == "/":
+                    in_block_comment = False
+                    out.append("  ")
+                    i += 2
+                    continue
+                out.append("\n" if ch == "\n" else " ")
+                i += 1
+                continue
+            if in_str is not None:
+                if ch == "\\" and nxt:
+                    out.append("  ")
+                    i += 2
+                    continue
+                if ch == in_str:
+                    in_str = None
+                out.append("\n" if ch == "\n" else " ")
+                i += 1
+                continue
+            if ch == "/" and nxt == "/":
+                in_line_comment = True
+                out.append("  ")
+                i += 2
+                continue
+            if ch == "#":
+                in_line_comment = True
+                out.append(" ")
+                i += 1
+                continue
+            if ch == "/" and nxt == "*":
+                in_block_comment = True
+                out.append("  ")
+                i += 2
+                continue
+            if ch in ("'", '"'):
+                in_str = ch
+                out.append(" ")
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+        return "".join(out)
+    except Exception:
+        return text
+
+
+_PHP_CLASSLIKE_RE = re.compile(r"\b(class|trait|interface)\s+([A-Za-z_]\w*)")
+_PHP_TOKEN_RE = re.compile(
+    r"\b(?:class|trait|interface)\s+[A-Za-z_]\w*"   # class-like opener
+    r"|\bfunction\s+([A-Za-z_]\w*)\s*\("            # named function/method
+    r"|[{}]"                                         # brace
+)
+
+
+def _detect_php_duplicate_method(repo: Path, patch: str) -> List[str]:
+    """Flag a method/function name declared more than once inside the SAME PHP
+    class/trait/interface body, when the patch ADDED at least one of the
+    declarations. PHP forbids two methods with the same name in one class — it is
+    a fatal "Cannot redeclare" error that prevents the class from loading, and
+    the sandbox has no php binary so the king's parser gates never catch it.
+
+    Brace-tracked + string/comment-masked + same-class-scoped (different classes
+    or traits may share a method name) + added-line-gated → near-zero FP.
+    Deterministic; stdlib only; never raises.
+    """
+    import bisect as _bisect
+    out: List[str] = []
+    try:
+        added = _added_newfile_linenos_by_file(patch)
+        for rel in _patch_changed_files(patch):
+            if len(out) >= 6:
+                break
+            if Path(rel).suffix.lower() not in _PHP_DUP_SUFFIXES:
+                continue
+            added_lines = added.get(rel) or set()
+            if not added_lines:
+                continue
+            full = (repo / rel).resolve()
+            try:
+                full.relative_to(repo.resolve())
+            except (ValueError, RuntimeError):
+                continue
+            if not full.exists():
+                continue
+            try:
+                src = full.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            masked = _mask_php_tokens(src)
+            line_starts = [0]
+            for idx, c in enumerate(src):
+                if c == "\n":
+                    line_starts.append(idx + 1)
+
+            def _lineno(off: int) -> int:
+                return _bisect.bisect_right(line_starts, off)
+
+            depth = 0
+            pending_class: Optional[str] = None
+            # stack frames: {"name", "body_depth", "methods": {name: [linenos]}}
+            stack: List[Dict[str, Any]] = []
+            for m in _PHP_TOKEN_RE.finditer(masked):
+                tok = m.group(0)
+                if tok in ("{", "}"):
+                    if tok == "{":
+                        depth += 1
+                        if pending_class is not None:
+                            stack.append({"name": pending_class, "body_depth": depth, "methods": {}})
+                            pending_class = None
+                    else:  # '}'
+                        if stack and depth == stack[-1]["body_depth"]:
+                            frame = stack.pop()
+                            for nm, lns in frame["methods"].items():
+                                if len(lns) >= 2 and any(l in added_lines for l in lns):
+                                    out.append(
+                                        f"{rel}: method '{nm}' is declared {len(lns)} times in "
+                                        f"the same '{frame['name']}' body (lines {', '.join(str(l) for l in lns[:5])}). "
+                                        f"PHP cannot redeclare a method — this is a fatal load error. "
+                                        f"Keep exactly one definition of '{nm}'."
+                                    )
+                                    if len(out) >= 6:
+                                        break
+                        depth -= 1
+                    continue
+                if m.group(1) is not None:
+                    # named function token
+                    if stack and depth == stack[-1]["body_depth"]:
+                        nm = m.group(1)
+                        stack[-1]["methods"].setdefault(nm, []).append(_lineno(m.start(1)))
+                    continue
+                # class/trait/interface opener
+                cm = _PHP_CLASSLIKE_RE.match(tok)
+                if cm:
+                    pending_class = cm.group(2)
+    except Exception:
+        return out[:6]
+    return out[:6]
 
 
 def _check_python_runtime_one(repo: Path, relative_path: str) -> Optional[str]:
