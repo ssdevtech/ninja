@@ -8343,19 +8343,29 @@ def _patch_ast_fingerprint(patch: str) -> str:
     return "|".join(parts)
 
 
-def _gps_dedupe_patches(candidates: List[Tuple[int, str]]) -> List[Tuple[int, str]]:
-    """Stage-1 prune: collapse AST- and hunk-identical samples."""
-    seen: set = set()
-    unique: List[Tuple[int, str]] = []
+def _gps_dedupe_patches(candidates: List[Tuple[int, str]]) -> List[Tuple[int, str, int]]:
+    """Stage-1 prune: collapse AST- and hunk-identical samples.
+
+    Returns (orig_idx, patch, dup_count) per surviving unique patch, where
+    dup_count is how many raw candidates collapsed into it (>=1). dup_count is
+    the exact-duplicate consensus signal: N coders independently emitting the
+    SAME patch is the strongest evidence it is correct, so the caller bootstraps
+    consensus votes with it instead of discarding it at dedup time (the old
+    code dropped this signal — exact dups silently became votes=1).
+    """
+    seen: Dict[Tuple[str, str], int] = {}
+    unique: List[List[Any]] = []
     for idx, patch in candidates:
         if not patch.strip():
             continue
         key = (_patch_ast_fingerprint(patch), str(sorted(_patch_hunk_signature(patch))))
-        if key in seen:
+        pos = seen.get(key)
+        if pos is not None:
+            unique[pos][2] += 1
             continue
-        seen.add(key)
-        unique.append((idx, patch))
-    return unique
+        seen[key] = len(unique)
+        unique.append([idx, patch, 1])
+    return [(idx, patch, count) for idx, patch, count in unique]
 
 
 def _execution_free_reward_score(
@@ -8445,15 +8455,22 @@ def _gps_prune_and_score(
     unique = _gps_dedupe_patches(raw)
     if not unique:
         return []
-    labeled = [(str(i), p) for i, (_, p) in enumerate(unique)]
+    labeled = [(str(i), p) for i, (_, p, _) in enumerate(unique)]
     clusters = _cluster_patches(labeled)
+    # Consensus = total RAW samples backing each approximate fix. dup_count
+    # recovers exact-duplicate agreement (collapsed at dedup); the cluster sum
+    # layers near-duplicate (Jaccard>=0.75) agreement on top. With no exact
+    # dups every dup_count is 1, so a cluster's vote total equals its size —
+    # identical to the prior behavior, hence no regression on that path.
+    dup_counts = [c for _, _, c in unique]
     vote_by_local: Dict[int, int] = {}
     for cluster in clusters:
+        cluster_votes = sum(dup_counts[local_i] for local_i in cluster)
         for local_i in cluster:
-            vote_by_local[local_i] = len(cluster)
+            vote_by_local[local_i] = cluster_votes
     scored: List[_GpsCandidate] = []
-    for local_i, (orig_idx, patch) in enumerate(unique):
-        votes = vote_by_local.get(local_i, 1)
+    for local_i, (orig_idx, patch, _) in enumerate(unique):
+        votes = vote_by_local.get(local_i, dup_counts[local_i])
         scored.append(
             _GpsCandidate(
                 source_idx=orig_idx,
@@ -8514,17 +8531,23 @@ def _gps_selector_dual_verify(
         return None
     if top[0].reward - top[1].reward > 8.0:
         return None
+    top3 = top[:3]
     blocks: List[str] = []
-    for i, cand in enumerate(top[:3]):
+    for i, cand in enumerate(top3):
         blocks.append(
             f"### Candidate {i + 1} (coder={cand.source_idx + 1}, "
             f"reward={cand.reward:.0f}, votes={cand.consensus_votes})\n"
             f"```diff\n{_truncate(cand.patch, 1400)}\n```"
         )
+    # Offer ONLY the digits that map to a real candidate. With 2 survivors the
+    # old prompt still said "1, 2, or 3"; a "3" reply then parsed out of range,
+    # the LLM verify call was wasted, and selection silently fell back to
+    # pool[0] — exactly the ambiguous near-tie this gate exists to break.
+    valid = "".join(str(i + 1) for i in range(len(top3)))
     prompt = (
         "You are the Selector agent. Pick the ONE patch most likely to fix the "
         "issue with the smallest correct change. Reply with ONLY a single digit "
-        "(1, 2, or 3).\n\n"
+        f"({'/'.join(valid)}).\n\n"
         f"ISSUE:\n{_truncate(issue_text, 2000)}\n\n"
         + "\n\n".join(blocks)
     )
@@ -8543,11 +8566,11 @@ def _gps_selector_dual_verify(
         )
     except Exception:
         return None
-    m = re.search(r"[123]", (response or "").strip())
+    m = re.search(f"[{valid}]", (response or "").strip())
     if not m:
         return None
     pick = int(m.group(0)) - 1
-    return pick if 0 <= pick < len(top[:3]) else None
+    return pick if 0 <= pick < len(top3) else None
 
 
 def _gps_selector_pick(
@@ -12217,10 +12240,6 @@ def _s3_file_added_lines(patch: str, target_path: str) -> int:
         count = 0
         for line in patch.splitlines():
             if line.startswith("diff --git "):
-                in_block = (f" a/{target_path} " in line + " " or f" b/{target_path}" in line + " "
-                            or line.endswith(f" b/{target_path}")
-                            or line.endswith(f" a/{target_path}"))
-                # robust: check via word match
                 in_block = (f" a/{target_path}" in line) or (f" b/{target_path}" in line)
                 continue
             if not in_block:
@@ -12623,17 +12642,16 @@ def _classify_issue_route(issue_text: str) -> str:
 def _build_pipeline_localization_context(repo: Path, issue_text: str) -> Tuple[str, List[str]]:
     """Fixed localization pass output for pipeline handoff / agent bootstrap."""
     ctx, files = build_preloaded_context(repo, issue_text)
-    tracked = set(_tracked_files(repo))
-    symbol_index = _build_repo_symbol_index(repo, tracked)
-    graph_nodes, graph_edges = _build_repo_graph(repo, symbol_index)
-    ranked, _ = _rank_context_files(repo, issue_text)
-    expanded = _expand_files_via_repograph(ranked, symbol_index, graph_nodes, graph_edges, issue_text)
+    # `files` already contains the ranked+repograph+augmented file list produced
+    # inside build_preloaded_context — reuse it directly instead of rebuilding
+    # the symbol index, repo graph, and ranking a second time (that was a full
+    # redundant AST pass over every tracked file on every pipeline-routed task).
     summary = (
         "### Pipeline localization (grounded starting context)\n"
-        f"Top files: {', '.join(expanded[:8])}\n\n"
+        f"Top files: {', '.join(files[:8])}\n\n"
         + (ctx[:6000] if ctx else "")
     )
-    return summary, expanded[:12]
+    return summary, files[:12]
 
 
 def _validate_pipeline_patch(
@@ -13645,8 +13663,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     ),
                     failed_node_ids=last_failed_test_names,
                 )
-            if probed:
-                test_fix_turns_used += 1
+            _ = probed  # suppress unused-variable warning; probed was a flow guard
             if test_failure is None:
                 return False
             if time_remaining() < _REFINEMENT_TIME_FLOOR_SECONDS:
@@ -13657,6 +13674,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 )
                 return False
             node_id, new_failure = test_failure
+            test_fix_turns_used += 1
             total_refinement_turns_used += 1
             queue_refinement_turn(
                 assistant_text,
