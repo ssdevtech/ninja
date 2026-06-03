@@ -49,12 +49,16 @@ Miner editing guide:
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import traceback
 import urllib.error
@@ -473,6 +477,62 @@ def chat_completion(
 # Shell execution
 # -----------------------------
 
+# Sandbox tool preflight (re-adopted from king 5f6194e, which king 419ccb2 dropped):
+# block commands that invoke a tool the sandbox lacks (no network / not installed)
+# BEFORE running them, returning a hint instead of wasting a step on a guaranteed
+# failure. Generalizes the rg-not-in-sandbox / test-runner rabbit-hole (065512)
+# defenses at the command layer. Probe is cached per tool; no branch-1 interaction
+# (pure per-command check, no shared mutable budget).
+_SANDBOX_TOOL_PROBE: Dict[str, bool] = {}
+
+_SANDBOX_MISSING_TOOL_HINTS: Tuple[str, ...] = (
+    ("rg", "rg is not installed — use `grep -rn` or `grep -rnF 'exact phrase'` instead."),
+    ("npm", "npm is not available (no network). Inspect and edit source directly."),
+    ("npx", "npx is not available."),
+    ("yarn", "yarn is not available."),
+    ("pnpm", "pnpm is not available."),
+    ("cargo", "cargo/rust is not installed — verify by reading code."),
+    ("rustc", "rustc is not installed."),
+    ("go", "go is not installed — verify by reading code instead of `go test`."),
+    ("node", "node is not installed."),
+    ("tsc", "tsc is not installed."),
+    ("dart", "dart is not installed."),
+    ("swift", "swift is not installed."),
+    ("mvn", "mvn is not installed."),
+    ("gradle", "gradle is not installed."),
+    ("jq", "jq is not installed — use python3 -c or grep/sed instead."),
+)
+
+
+def _sandbox_has_executable(name: str) -> bool:
+    key = (name or "").strip()
+    if not key or not re.fullmatch(r"[A-Za-z0-9_.+-]+", key):
+        return True
+    if key not in _SANDBOX_TOOL_PROBE:
+        try:
+            proc = subprocess.run(
+                ["bash", "-lc", f"command -v {key} >/dev/null 2>&1"],
+                capture_output=True,
+                timeout=3,
+                check=False,
+            )
+            _SANDBOX_TOOL_PROBE[key] = proc.returncode == 0
+        except Exception:
+            _SANDBOX_TOOL_PROBE[key] = False
+    return _SANDBOX_TOOL_PROBE[key]
+
+
+def _sandbox_command_preflight(command: str) -> Optional[str]:
+    lowered = command.strip().lower()
+    for tool, hint in _SANDBOX_MISSING_TOOL_HINTS:
+        if re.search(rf"(?:^|[;&|]\s*){re.escape(tool)}\b", lowered):
+            if not _sandbox_has_executable(tool):
+                return hint
+    if re.search(r"\bpip\s+install\b", lowered) or re.search(r"\bpip3\s+install\b", lowered):
+        return "pip install is blocked (no network). Use only dependencies already in the repo."
+    return None
+
+
 # MINER-EDITABLE: This is the bash tool surface your agent uses inside the task
 # repo. You may improve command validation, environment handling, timeouts, and
 # output shaping. Keep commands scoped to the repo and avoid secrets or network
@@ -487,6 +547,17 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
             stdout="",
             stderr="Empty command ignored.",
             duration_sec=0.0,
+        )
+
+    preflight = _sandbox_command_preflight(command)
+    if preflight:
+        return CommandResult(
+            command=command,
+            exit_code=127,
+            stdout="",
+            stderr=preflight,
+            duration_sec=0.0,
+            blocked=True,
         )
 
     blocked_pattern = _is_dangerous_command(command)
@@ -1586,9 +1657,18 @@ _LOCALIZE_TFIDF_WEIGHT = 0.45
 _LOCALIZE_TOP_SYMBOLS_PER_FILE = 5
 _LOCALIZE_SYMBOL_CTX_BEFORE = 6
 _LOCALIZE_SYMBOL_CTX_AFTER = 18
-# Set only during build_preloaded_context so _rank_context_files keeps king signature.
-_SYMBOL_INDEX_FOR_RANKING: Optional[Dict[str, FileSkeleton]] = None
-_PRELOAD_TRACE_FRAMES: List[Tuple[str, int]] = []
+# Thread-local so the parallel exploratory branch (branch 1) and the in-place
+# multishot (branch 0) cannot clobber each other's ranking state. Set only during
+# build_preloaded_context so _rank_context_files keeps the king signature.
+_SOLVE_TLS = threading.local()
+
+
+def _get_symbol_index_for_ranking() -> "Optional[Dict[str, FileSkeleton]]":
+    return getattr(_SOLVE_TLS, "symbol_index", None)
+
+
+def _get_preload_trace_frames() -> "List[Tuple[str, int]]":
+    return getattr(_SOLVE_TLS, "preload_frames", [])
 
 # RE-based localization (trace frames, exceptions, docstrings, JS call graph).
 _TRACE_FRAME_RE = re.compile(r'File "([^"]+)", line (\d+)')
@@ -2888,15 +2968,14 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         issue_symbols = []
     search_issue = issue if not issue_symbols else issue + '\n' + '\n'.join(issue_symbols)
     symbol_index = _build_repo_symbol_index(repo, tracked_set)
-    global _SYMBOL_INDEX_FOR_RANKING, _PRELOAD_TRACE_FRAMES
-    _PRELOAD_TRACE_FRAMES = _extract_trace_frames(issue, tracked_set)
-    fault_sites = list(_PRELOAD_TRACE_FRAMES)
+    _SOLVE_TLS.preload_frames = _extract_trace_frames(issue, tracked_set)
+    fault_sites = list(_SOLVE_TLS.preload_frames)
     graph_nodes, graph_edges = _build_repo_graph(repo, symbol_index)
-    _SYMBOL_INDEX_FOR_RANKING = symbol_index
+    _SOLVE_TLS.symbol_index = symbol_index
     try:
         files, top_score = _rank_context_files(repo, issue)
     finally:
-        _SYMBOL_INDEX_FOR_RANKING = None
+        _SOLVE_TLS.symbol_index = None
 
     files = _expand_files_via_repograph(
         files, symbol_index, graph_nodes, graph_edges, search_issue,
@@ -2962,8 +3041,9 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(rescue_banner)
         used += len(rescue_banner)
 
-    if _PRELOAD_TRACE_FRAMES:
-        pin_block = _format_trace_pin_block(repo, _PRELOAD_TRACE_FRAMES)
+    _ptf = _get_preload_trace_frames()
+    if _ptf:
+        pin_block = _format_trace_pin_block(repo, _ptf)
         if pin_block and used + len(pin_block) <= MAX_PRELOADED_CONTEXT_CHARS + 3500:
             parts.append(pin_block)
             used += len(pin_block)
@@ -3001,7 +3081,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         sk = symbol_index.get(relative_path)
         if sk:
             localized_syms = _localize_file_symbols(
-                search_issue, sk, trace_frames=_PRELOAD_TRACE_FRAMES,
+                search_issue, sk, trace_frames=_get_preload_trace_frames(),
             )
             snippet = _read_localized_symbol_regions(
                 repo, relative_path, budget, localized_syms, needles=needles,
@@ -3091,6 +3171,36 @@ def _term_idf_weights(terms: List[str], tracked: List[str]) -> Dict[str, float]:
     return out
 
 
+_VENDORED_PATH_RE = re.compile(
+    r"(^|/)(third[_-]?party|thirdparty|vendor|vendored|external|extern|deps|"
+    r"node_modules|bower_components|site-packages|dist-packages|\.cargo|"
+    r"capstone|imgui|imguifiledialog|glm|eigen|googletest|gtest|catch2|"
+    r"submodule|submodules)(/|$)",
+    re.IGNORECASE,
+)
+_VENDORED_BASENAME_RE = re.compile(
+    r"^(json\.hpp|imgui[_a-z0-9]*\.(h|hpp|cpp)|imstb_\w+\.h|stb_\w+\.h|"
+    r"catch\.hpp|doctest\.h|tinyxml\w*\.\w+)$",
+    re.IGNORECASE,
+)
+# Rank penalty for vendored / third-party files in context selection. They are
+# almost never the task target (measured: 0/419 golden tasks modify a vendored
+# path), yet on big monorepos they FLOOD the preloaded context (task 065547: the
+# target lsdriver/virtual_input.h ranked #0 but ranks 1-14 were all vendored
+# Android-LS/jni capstone/ImGui files, luring the model to wander there). Penalty
+# deprioritizes (not excludes — a strongly-matched vendored file can still
+# surface, and the model can still grep/read it). Never applied to a file the
+# issue explicitly mentions.
+_VENDORED_RANK_PENALTY = 80
+
+
+def _is_vendored_path(relative_path: str) -> bool:
+    """Heuristic: a known vendored / third-party path or basename."""
+    if _VENDORED_PATH_RE.search(relative_path):
+        return True
+    return bool(_VENDORED_BASENAME_RE.match(Path(relative_path).name))
+
+
 def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
     """Returns (ranked_paths, top_score). top_score is the highest computed
     score in the scoring pass; callers use it to detect "weak ranking"
@@ -3177,7 +3287,12 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
             )
         score += trace_boost.get(relative_path, 0)
         if score > 0:
-            scored.append((score, relative_path))
+            # Deprioritize vendored/third-party files (unless the issue explicitly
+            # names them) so they don't flood the preloaded context on monorepos.
+            if relative_path not in mentioned and _is_vendored_path(relative_path):
+                score -= _VENDORED_RANK_PENALTY
+            if score > 0:
+                scored.append((score, relative_path))
 
     scored.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
     ranked: List[str] = []
@@ -3192,7 +3307,7 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
         # Explicit path or backtick-ident match: ranking is strong even if
         # the scored list is empty (mentioned files bypass the score loop).
         top_score = max(top_score, 100)
-    idx = _SYMBOL_INDEX_FOR_RANKING
+    idx = _get_symbol_index_for_ranking()
     if idx:
         reranked, loc_top = _multistep_localize_file_ranking(issue, ranked, idx)
         if reranked:
@@ -4750,6 +4865,143 @@ def _js_module_file_missing(repo: Path, importer_full: Path, mod: str) -> bool:
     return True
 
 
+# JS/TS keywords + common globals that are never "undeclared" even in value
+# position. Over-inclusive on purpose: a name here is simply never flagged, so
+# adding to it only removes false positives.
+_JS_VALUE_KEYWORDS = {
+    "if", "else", "for", "while", "do", "switch", "case", "default", "break",
+    "continue", "return", "function", "var", "let", "const", "class", "extends",
+    "super", "this", "new", "delete", "typeof", "instanceof", "in", "of", "void",
+    "yield", "await", "async", "try", "catch", "finally", "throw", "import",
+    "export", "from", "as", "static", "get", "set", "public", "private",
+    "protected", "readonly", "abstract", "interface", "type", "enum", "namespace",
+    "declare", "implements", "true", "false", "null", "undefined", "arguments",
+    "NaN", "Infinity", "satisfies", "keyof", "infer", "is",
+}
+_JS_GLOBALS = {
+    "window", "document", "console", "process", "module", "exports", "require",
+    "global", "globalThis", "Math", "JSON", "Object", "Array", "String", "Number",
+    "Boolean", "Date", "RegExp", "Promise", "Map", "Set", "WeakMap", "WeakSet",
+    "Symbol", "Error", "TypeError", "RangeError", "Proxy", "Reflect", "BigInt",
+    "parseInt", "parseFloat", "isNaN", "isFinite", "encodeURIComponent",
+    "decodeURIComponent", "encodeURI", "decodeURI", "setTimeout", "setInterval",
+    "clearTimeout", "clearInterval", "queueMicrotask", "fetch", "Request",
+    "Response", "Headers", "URL", "URLSearchParams", "Buffer", "__dirname",
+    "__filename", "structuredClone", "FormData", "Blob", "File", "FileReader",
+    "localStorage", "sessionStorage", "navigator", "location", "history", "alert",
+    "atob", "btoa", "performance", "crypto", "AbortController", "Event",
+    "CustomEvent", "react", "self",
+}
+_JS_IDENT_RE = re.compile(r"[A-Za-z_$][\w$]*")
+_JS_DECL_KW_RE = re.compile(
+    r"\b(?:const|let|var|function|class|interface|type|enum|namespace)\s+"
+    r"([A-Za-z_$][\w$]*)"
+)
+
+
+def _js_near_twin(used: str, declared: str) -> bool:
+    """Typo signature: `used` and `declared` differ ONLY by a trailing
+    digit/underscore suffix (validate vs validate1, foo vs foo_2). This narrow
+    form is deliberately the ONLY twin accepted — general edit-distance-1 was
+    tried and produced false positives on ordinary short words (color/colors,
+    peso/pelo) and JSX text, since common words have many distance-1 neighbours
+    that happen to be declared. Suffix-digit twins effectively never occur in
+    natural-language JSX text, so this keeps false positives near zero."""
+    if used == declared or len(used) < 3 or len(declared) < 3:
+        return False
+    if declared.startswith(used) and declared[len(used):].lstrip("_").isdigit():
+        return True
+    if used.startswith(declared) and used[len(declared):].lstrip("_").isdigit():
+        return True
+    return False
+
+
+def _js_declared_names(clean_source: str) -> set:
+    """Generous (over-inclusive) set of names BOUND somewhere in the file: decl
+    keywords, destructuring binds, import bindings, AND every identifier inside
+    any (...) group (covers params + call args). Over-collection is SAFE here —
+    a name treated as declared is simply never flagged, trading recall for
+    near-zero false positives."""
+    names = set(_JS_DECL_KW_RE.findall(clean_source))
+    for m in re.finditer(r"\b(?:const|let|var)\s*([{\[])", clean_source):
+        start = m.end() - 1
+        depth = 0
+        buf: List[str] = []
+        for ch in clean_source[start:start + 400]:
+            if ch in "{[":
+                depth += 1
+            elif ch in "}]":
+                depth -= 1
+                if depth == 0:
+                    break
+            else:
+                buf.append(ch)
+        for piece in re.split(r"[,\s]+", "".join(buf)):
+            piece = piece.strip()
+            if not piece:
+                continue
+            if ":" in piece:
+                piece = piece.split(":")[-1]
+            piece = piece.split("=")[0].strip().lstrip(".")
+            mm = re.match(r"^([A-Za-z_$][\w$]*)", piece)
+            if mm:
+                names.add(mm.group(1))
+    for m in _JS_IMPORT_FROM_RE.finditer(clean_source):
+        body = m.group("body") or ""
+        for _imp, loc in _js_named_import_pairs(body):
+            names.add(loc)
+        for mm in re.finditer(r"\*\s*as\s+([A-Za-z_$][\w$]*)", body):
+            names.add(mm.group(1))
+        for mm in re.finditer(r"(^|,)\s*([A-Za-z_$][\w$]*)\s*(,|$)", body):
+            names.add(mm.group(2))
+    for m in re.finditer(r"\(([^()]*)\)", clean_source):
+        for mm in _JS_IDENT_RE.finditer(m.group(1)):
+            names.add(mm.group(0))
+    return names
+
+
+def _js_used_undeclared_typo(path: str, source: str, added: List[str]) -> List[str]:
+    """Flag a lowercase identifier USED in an added line that is (a) never
+    declared anywhere in the post-patch file, (b) not a JS/DOM/Node global, and
+    (c) a near-twin of a name that IS declared — the typo fingerprint behind
+    'references undefined X -> ReferenceError at runtime' diff-judge losses
+    (e.g. using `validate` when only `validate1` is declared). The declared-twin
+    requirement keeps false positives near zero: an unknown name with no similar
+    declared sibling is left to the model/judge, not flagged."""
+    res: List[str] = []
+    clean_src = _js_strip_comments_strings(source)
+    declared = _js_declared_names(clean_src)
+    if not declared:
+        return res
+    seen: set = set()
+    for ln in added:
+        stripped = ln.lstrip()
+        if stripped.startswith(("import ", "export ", "//", "*", "/*")):
+            continue
+        cl = _js_strip_comments_strings(ln)
+        cl = re.sub(r"\.\s*[A-Za-z_$][\w$]*", " ", cl)  # drop property accesses
+        for mm in _JS_IDENT_RE.finditer(cl):
+            u = mm.group(0)
+            if u in seen or not u[0].islower() or len(u) < 3:
+                continue
+            nxt = cl[mm.end():mm.end() + 1]
+            if nxt in (":", "="):  # object key / label / JSX attr / assignment LHS
+                continue
+            if u in declared or u in _JS_GLOBALS or u in _JS_VALUE_KEYWORDS:
+                continue
+            twin = next((d for d in declared if _js_near_twin(u, d)), None)
+            if twin is None:
+                continue
+            seen.add(u)
+            res.append(
+                f"{path}: '{u}' is used but never declared in this file; did you "
+                f"mean '{twin}'? (likely a typo — ReferenceError at runtime)"
+            )
+            if len(res) >= 2:
+                return res
+    return res
+
+
 def _broken_refs_js(path: str, source: str, added: List[str], full: Path, repo: Path) -> List[str]:
     res: List[str] = []
     # Missing module FILE: imports from a relative path with no file behind it →
@@ -4795,6 +5047,10 @@ def _broken_refs_js(path: str, source: str, added: List[str], full: Path, repo: 
         for imp, _loc in pairs:
             if not re.search(rf"\b{re.escape(imp)}\b", ttext):
                 res.append(f"{path}: imports '{imp}' from '{mod}', but {target.name} does not define it — add/export it there or fix the import (broken reference)")
+    try:
+        res.extend(_js_used_undeclared_typo(path, source, added))
+    except Exception:
+        pass
     return res
 
 
@@ -7509,6 +7765,74 @@ def _run_companion_test(
     return None  # other languages: skip
 
 
+# Signatures of a baseline test that could not be EXECUTED (sandbox tooling /
+# missing-dependency / loader failure) rather than a genuine assertion failure.
+# When every surfaced baseline failure matches one of these, "make these tests
+# pass" is the wrong framing: the sandbox simply cannot run the test (no TS
+# loader, no installed dep, no network). Treating it as the task makes the model
+# rabbit-hole on the test runner and never implement the issue (a real loss:
+# 18 steps spent on vitest.config for ERR_UNKNOWN_FILE_EXTENSION, zero features).
+_NONACTIONABLE_TEST_FAILURE_MARKERS = (
+    "ERR_UNKNOWN_FILE_EXTENSION",
+    "Unknown file extension",
+    "ERR_MODULE_NOT_FOUND",
+    "Cannot find module",
+    "Cannot find package",
+    "ModuleNotFoundError",
+    "ImportError: cannot import name",
+    "Failed to resolve import",
+    "Failed to load",
+    "command not found",
+    ": not found",
+    "No such file or directory",
+    "ERR_REQUIRE_ESM",
+)
+# If a failure tail shows any of these, it is a GENUINE assertion failure (the
+# test ran and an expectation failed) and stays actionable even if the message
+# also happens to contain a generic phrase like "No such file or directory" or
+# "Cannot find module" (which a real test can legitimately assert about). Biases
+# toward keeping the normal 'make these pass' framing — the safe direction.
+_ACTIONABLE_ASSERTION_MARKERS = (
+    "AssertionError",
+    "AssertionFailedError",
+    "expect(",
+    "expected ",
+    "to equal",
+    "to be ",
+    "tobe",
+    "toequal",
+    "tohavebeen",
+    "received",
+    " assert ",
+)
+
+
+def _baseline_failure_reason_if_nonactionable(
+    failing: List[Tuple[str, str]],
+) -> Optional[str]:
+    """If EVERY surfaced baseline failure is an un-runnable tooling/environment
+    error (not a real assertion failure), return a short reason string; else
+    None. Conservative: a single genuine-looking failure keeps the normal
+    'make these pass' framing. A tail carrying an assertion signature is always
+    treated as actionable, even if it also contains a generic env phrase (so a
+    real test asserting e.g. 'No such file or directory' is not mis-suppressed)."""
+    if not failing:
+        return None
+    reason: Optional[str] = None
+    for _node_id, tail in failing[:3]:
+        low = (tail or "").lower()
+        if any(a in low for a in _ACTIONABLE_ASSERTION_MARKERS):
+            return None  # genuine assertion failure -> normal framing
+        hit = next(
+            (m for m in _NONACTIONABLE_TEST_FAILURE_MARKERS if m.lower() in low),
+            None,
+        )
+        if hit is None:
+            return None  # at least one failure looks actionable -> normal framing
+        reason = reason or hit
+    return reason
+
+
 def _run_failing_tests_baseline(
     repo: Path,
     candidate_nodes: List[Tuple[str, str]],
@@ -7625,9 +7949,36 @@ def _format_failing_tests_section(failing: List[Tuple[str, str]]) -> str:
     at the top of the initial user prompt. Each entry surfaces the test node id
     and the failure tail — ground-truth verification targets the patch should
     satisfy. Empty input returns an empty string so the caller can prepend
-    unconditionally."""
+    unconditionally.
+
+    When every surfaced failure is an un-runnable tooling/environment error
+    (e.g. the sandbox cannot execute `.ts` tests), the block is REFRAMED: it
+    tells the model the failures are sandbox noise, NOT a code bug, and to
+    implement the issue rather than fix the test runner."""
     if not failing:
         return ""
+    _nonactionable = _baseline_failure_reason_if_nonactionable(failing)
+    if _nonactionable:
+        parts = [
+            "### Baseline tests could not be EXECUTED in this sandbox — NOT a code bug",
+            f"The repo's tests fail to even run here (`{_nonactionable}`): the sandbox "
+            "lacks the toolchain/dependency/network needed to execute them (see SANDBOX "
+            "REALITY). This is an environment limitation, NOT the task. Do NOT modify the "
+            "test runner, test config (e.g. vitest/jest/tsconfig), or try to make the test "
+            "command run — that wastes steps and does not address the issue. **Implement the "
+            "feature described in the issue below** and verify your change by reading the "
+            "code carefully. The issue text is the task.",
+            "",
+        ]
+        for node_id, tail in failing[:3]:
+            if len(tail) > 600:
+                tail = tail[:400] + "\n…[truncated]…\n" + tail[-160:]
+            parts.append(f"#### `{node_id}` (could not execute)")
+            parts.append("```")
+            parts.append(tail)
+            parts.append("```")
+            parts.append("")
+        return "\n".join(parts) + "\n"
     parts = [
         "### Currently failing tests on this repo (run BEFORE any edits — these demonstrate the issue)",
         "Make these tests pass. Their failures are the ground-truth verification target. "
@@ -9586,6 +9937,8 @@ When the issue quotes a long error message, stack trace line, or expected output
 
 Avoid: re-reading preloaded files, broad recursive searches, generated/vendor/minified bundles, broad test suites before a targeted fix exists.
 
+FOCUS & COMPLETENESS: on a large repo, stay in the files the issue is actually about — the top-ranked preloaded files and the path/symbols the issue names. Do NOT wander into unrelated or vendored/third-party subtrees (e.g. bundled libraries, `third_party/`, `vendor/`, ImGui/capstone-style deps) — the task is not there and browsing them burns the budget. Conversely, when the issue lists multiple behaviors or acceptance criteria, implement EVERY one of them: a patch that does only the easiest part (e.g. one constant) while skipping the substantive logic scores near zero. Size the fix to what the issue requires — minimal for a focused bug, complete for a multi-part feature.
+
 SANDBOX REALITY — your shell is a minimal Linux container (python3, bash, git, grep, sed, awk, find, sort, cat, ls). The following are NOT installed: `rg`, `node`/`npm`/`npx`, `go`, `cargo`/`rustc`, `tsc`, `swiftc`, `dart`, `jq`, `tree`, `gcc`/`g++`, `java`/`mvn`. There is NO network — `pip install`, `npm install`, `go get`, dependency downloads, and curl/wget all FAIL. Do NOT spend steps invoking absent tools or installing anything: for non-Python repos (JS/TS/Go/Rust/Swift/Dart/Java) you usually CANNOT run their build or tests, so verify by reading the code carefully instead. `python3 -m pytest` works only when the project's deps are already importable; if a test command errors with ModuleNotFound or command-not-found, stop retrying it and rely on careful code review. Every wasted command is a step you do not get back on a short wall.
 
 ====================================================================
@@ -10022,6 +10375,12 @@ def build_self_check_prompt(
         "CORRECTNESS (LLM judge weight — high impact):\n"
         "  - Does the patch fix the ROOT CAUSE, not just suppress the symptom?\n"
         "  - Are edge cases mentioned in the issue handled?\n"
+        "  - DATA-FLOW TRACE: for any value that round-trips (client→server→client, or is "
+        "stored then read back) or any shared state, trace it end-to-end — where it is SET, "
+        "where it is READ, that the variable is in SCOPE at the read site (NOT declared inside "
+        "another function/closure), and that the TYPES match on both ends (e.g. not a string "
+        "id compared with `!==` to a number). A value read where it is undefined, out of scope, "
+        "or type-mismatched makes the feature silently inert even though the code 'looks' done.\n"
         "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
         "COMPLETENESS (LLM judge weight — high impact):\n"
@@ -12604,6 +12963,230 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
 # revert-and-retry on a low-signal first attempt. Inner attempt is dispatched
 # through **kwargs so the validator-protected parameter signature appears
 # only in `solve` itself (not duplicated in a helper).
+# --- Parallel exploratory branch (branch 1) --------------------------------
+# Run ONE additional exploratory attempt on an isolated repo copy CONCURRENTLY
+# with the in-place multishot (branch 0), then ship whichever patch scores
+# higher. Branch 1 is a single `_solve_attempt` (not a second multishot) given a
+# diversity hint, so it explores a distinct approach at ~one extra attempt of
+# cost. Its budget finishes before the multishot's, so it never extends the wall
+# (no added timeout risk). Mirrors branch 1 of the parallel-branch agent.
+_BRANCH1_WALL_CLOCK_BUDGET = WALL_CLOCK_BUDGET_SECONDS  # single-attempt budget
+_BRANCH1_HINT = (
+    "BRANCH HINT: Before editing, spend one extra inspection step verifying "
+    "the bug's owner. Specifically check (1) the test file that covers the "
+    "affected behavior if one exists, and (2) any call-site that depends on "
+    "the function you intend to change. Then make the smallest patch that "
+    "fixes the ROOT CAUSE.\n\n"
+)
+
+
+def _copy_repo_for_branch(source: Path) -> Optional[str]:
+    """Deep-copy `source` into a fresh temp dir; return the new path (or None)."""
+    try:
+        parent = tempfile.mkdtemp(prefix="agent_branch_")
+        dest = os.path.join(parent, "repo")
+        shutil.copytree(str(source), dest, symlinks=True)
+        return dest
+    except Exception:
+        return None
+
+
+def _cleanup_branch_copy(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        parent = os.path.dirname(path)
+        if parent and parent.startswith(tempfile.gettempdir() + os.sep):
+            shutil.rmtree(parent, ignore_errors=True)
+    except Exception:
+        pass
+
+
+# Full-timeout extension for branch 1 (always on). Branch 1 extends its soft
+# budget in 30s steps and resumes (checkpointing its best clean patch each step)
+# up to the ceiling, and the driver pins that checkpoint onto the primary tree
+# so a timeout-kill collects branch 1's work. The container is hard-killed at
+# max(timeout, 300)s; if branch 1 runs past it the run still ships branch 0's
+# in-place multishot patch (floor, never 0).
+_BRANCH1_WALL_CEILING = 500.0
+_CHECKPOINT_EXTENSION_SECONDS = 30.0
+_CHECKPOINT_POLL_SECONDS = 5.0
+# --- Atomic primary-tree publish (full extension, zero empty-tree window) ---
+# The validator reads the patch from the PRIMARY repo folder when the agent is
+# hard-killed (at max(task_timeout, 300)s; the timeout is NOT passed to solve()).
+# The in-place swap (git checkout -> clean -> apply) leaves a sub-second window
+# where the tree is EMPTY; a kill there ships an empty patch == solver_error ==
+# 0 that round (the duel 5904 / 4544 catastrophic-floor family). get_patch()
+# reads "working tree vs index" with HEAD pinned at base, so NO git command can
+# swap the tree near-atomically without either emptying it or staging into the
+# index (both make the diff empty). The only window-free swap is at the
+# FILESYSTEM level: build the next tree in a sibling dir on the same fs, then
+# atomically EXCHANGE the two directories via renameat2(RENAME_EXCHANGE) -- one
+# syscall a kill cannot catch half-done, so a kill always reads a whole tree
+# (the old patch or the new one, never empty). If the fs/syscall does not
+# support it we fall back to the windowed in-place swap below (option-1
+# behaviour: full extension, ~1% empty-tree risk).
+_RENAME_EXCHANGE = 1 << 1  # linux uapi/linux/fs.h RENAME_EXCHANGE
+_AT_FDCWD = -100
+_renameat2_unavailable = False
+
+
+def _renameat2_exchange(path_a: str, path_b: str) -> bool:
+    """Atomically exchange two existing paths (Linux renameat2 RENAME_EXCHANGE).
+    Returns True on success; caches + returns False if the kernel/fs/libc does
+    not support it, so callers fall back to the windowed swap."""
+    global _renameat2_unavailable
+    if _renameat2_unavailable:
+        return False
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        res = libc.renameat2(
+            ctypes.c_int(_AT_FDCWD), ctypes.c_char_p(os.fsencode(path_a)),
+            ctypes.c_int(_AT_FDCWD), ctypes.c_char_p(os.fsencode(path_b)),
+            ctypes.c_uint(_RENAME_EXCHANGE),
+        )
+        if res == 0:
+            return True
+        e = ctypes.get_errno()
+        # unsupported syscall / flag / cross-filesystem -> stop trying entirely
+        if e in (errno.ENOSYS, errno.EINVAL, errno.EXDEV, getattr(errno, "EOPNOTSUPP", 95)):
+            _renameat2_unavailable = True
+    except Exception:
+        _renameat2_unavailable = True
+    return False
+
+
+def _copy_repo_same_fs(source: Path) -> Optional[str]:
+    """Deep-copy `source` into a hidden sibling dir on the SAME filesystem (so
+    renameat2 can exchange them; rename cannot cross filesystems, which is why
+    this is a sibling and not under /tmp). Returns the path, or None -- in which
+    case the caller disables atomic publish and uses the windowed fallback."""
+    try:
+        src = os.path.abspath(str(source))
+        parent = os.path.dirname(src) or "."
+        dest = os.path.join(parent, ".agent_stage_%d" % os.getpid())
+        if os.path.exists(dest):
+            shutil.rmtree(dest, ignore_errors=True)
+        shutil.copytree(src, dest, symlinks=True)
+        return dest
+    except Exception:
+        return None
+
+
+def _stage_patch_in_tree(stage: Path, patch_text: str) -> bool:
+    """Reset `stage` to base (HEAD) and apply `patch_text` to its WORKING TREE
+    (index stays at base, mirroring how branch 0 leaves the primary), so
+    get_patch(stage) reproduces `patch_text`. Runs entirely off the critical
+    path -- `stage` is never what the validator reads until an atomic exchange,
+    so its own empty window is harmless. Returns True on success."""
+    if not patch_text.strip():
+        return False
+    try:
+        subprocess.run(["git", "checkout", "--", "."], cwd=str(stage),
+                       capture_output=True, text=True, timeout=30, check=False)
+        subprocess.run(["git", "clean", "-fd"], cwd=str(stage),
+                       capture_output=True, text=True, timeout=30, check=False)
+        return _multishot_apply_patch(stage, patch_text)
+    except Exception:
+        return False
+
+
+def _branch1_ship_blocked(tree: Path, patch: str) -> bool:
+    """Strict, low-false-positive ship-blocker test for the branch-1 best-of
+    veto. Fires ONLY on high-confidence build-breaks: a genuine parse/syntax
+    failure (the real compiler/parser, not a heuristic) or the measured-0-FP
+    undefined-identifier typo (P1, `_js_used_undeclared_typo`). It deliberately
+    EXCLUDES the heuristic broken-reference checks in `_check_syntax`
+    (duplicate-declaration, missing-React-import, import-resolution) — those
+    have known false positives on correct code (verified: they wrongly flag the
+    golden reference patch for task 065176), so vetoing on them would discard
+    legitimate branch-1 wins. Returns True only when branch 1's patch is almost
+    certainly build-broken; branch 0 then stays on the primary tree as floor."""
+    try:
+        changed = _patch_changed_files(patch)
+    except Exception:
+        return False
+    added_by_file: Optional[Dict[str, List[str]]] = None
+    for rel in changed:
+        suf = Path(rel).suffix.lower()
+        try:
+            res = None
+            if suf in {".js", ".mjs", ".cjs"}:
+                res = _check_node_syntax_one(tree, rel)
+            elif suf in {".ts", ".tsx", ".mts", ".cts"}:
+                res = _check_ts_syntax_one(tree, rel)
+            elif suf == ".py":
+                res = _check_python_syntax_one(tree, rel)
+            elif suf == ".go":
+                res = _check_go_syntax_one(tree, rel)
+            elif suf == ".rs":
+                res = _check_rust_syntax_one(tree, rel)
+            if res:
+                return True
+        except Exception:
+            pass
+        if suf in _JS_TS_SUFFIXES:
+            try:
+                if added_by_file is None:
+                    added_by_file = _patch_added_lines_by_file(patch)
+                src = _br_safe_read(tree / rel)
+                if src is not None and _js_used_undeclared_typo(
+                    rel, src, added_by_file.get(rel, [])
+                ):
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def _atomic_publish(primary: Path, stage: str, patch_text: str) -> bool:
+    """Publish `patch_text` onto the primary tree with NO empty window: build it
+    in `stage` (off critical path), then atomically EXCHANGE stage <-> primary.
+    On any failure primary is untouched (still holds the prior complete patch).
+    After success the dirs are swapped: primary serves patch_text, `stage` now
+    holds the previous content (reset on the next publish, removed at cleanup).
+
+    Fix A (best-of syntax veto): every patch published here is a branch-1
+    candidate. Branch 1 bypasses _finalize and wins best-of on size
+    (_patch_duel_score), so a bigger-but-build-broken branch-1 patch could
+    displace the clean branch-0 floor and then lose the round (duels 066499 /
+    065557 / 065915). Once staged, run _check_syntax on the staged tree (the
+    patch is already applied there, so it is free) and REFUSE the swap if it
+    trips a ship-blocker — branch 0 stays on the primary tree as the floor."""
+    if not _stage_patch_in_tree(Path(stage), patch_text):
+        return False
+    try:
+        if _branch1_ship_blocked(Path(stage), patch_text):
+            return False
+    except Exception:
+        pass
+    return _renameat2_exchange(str(primary), stage)
+
+
+def _checkpoint_swap_to_primary(repo: Path, patch_text: str, fallback_patch: str) -> bool:
+    """Overwrite the primary working tree with `patch_text` (a branch-1 clean
+    checkpoint) so a timeout-kill collects it. Reset to the committed base, then
+    apply; on failure restore `fallback_patch` (branch 0's patch) so the tree is
+    never empty/half. Call only once branch 0 (the in-place multishot) is done."""
+    if not patch_text.strip():
+        return False
+
+    def _reset() -> None:
+        subprocess.run(["git", "checkout", "--", "."], cwd=str(repo),
+                       capture_output=True, text=True, timeout=30, check=False)
+        subprocess.run(["git", "clean", "-fd"], cwd=str(repo),
+                       capture_output=True, text=True, timeout=30, check=False)
+    try:
+        _reset()
+        if _multishot_apply_patch(repo, patch_text):
+            return True
+        _reset()
+        _multishot_apply_patch(repo, fallback_patch)
+    except Exception:
+        pass
+    return False
+
+
 def solve(
     repo_path: str,
     issue: str,
@@ -12618,13 +13201,146 @@ def solve(
     Main portable interface for validators.
 
     Wrap the multi-shot driver so exceptions and late kills return the best
-    on-disk patch instead of an avoidable empty result.
+    on-disk patch instead of an avoidable empty result. Branch 0 is the full
+    in-place multishot; branch 1 is one parallel exploratory attempt on a repo
+    copy. The higher-scoring patch is swapped onto the primary tree and shipped.
     """
-    return _solve_with_safety_net(
+    base_kwargs = dict(
         repo_path=repo_path, issue=issue, model=model,
         api_base=api_base, api_key=api_key,
         max_steps=max_steps, command_timeout=command_timeout, max_tokens=max_tokens,
     )
+    _started = time.monotonic()
+    _primary = None
+    _init_head = None
+    try:
+        _primary = _repo_path(repo_path)
+        _init_head = _multishot_capture_head(_primary)
+    except Exception:
+        pass
+
+    # Branch 1: one exploratory attempt on an isolated copy, in parallel. When
+    # full-timeout is ON it extends/resumes + checkpoints (publishing to _b1_sink).
+    _b1: Dict[str, Any] = {}
+    _b1_sink: Dict[str, Any] = {}
+    _b1_copy = _copy_repo_for_branch(_primary) if _primary is not None else None
+    _b1_thread: Optional[threading.Thread] = None
+    if _b1_copy:
+        _b1_kwargs = {
+            **base_kwargs,
+            "repo_path": _b1_copy,
+            "_wall_clock_budget": _BRANCH1_WALL_CLOCK_BUDGET,
+            "_prior_attempt_summary": _BRANCH1_HINT,
+            "_checkpoint_resume": True,
+            # Full timeout extension: branch 1 grinds on its copy up to the
+            # ceiling. Atomic publish makes capturing its result safe at ANY
+            # time, so the budget is no longer gated by a swap-safety wall.
+            "_hard_return_budget": _BRANCH1_WALL_CEILING - WALL_CLOCK_RESERVE_SECONDS,
+            "_checkpoint_sink": _b1_sink,
+        }
+
+        def _run_branch1() -> None:
+            try:
+                _b1["result"] = _solve_attempt(**_b1_kwargs)
+            except BaseException:
+                _b1["result"] = None
+        _b1_thread = threading.Thread(target=_run_branch1, daemon=True, name="agent-branch-1")
+        _b1_thread.start()
+
+    # Branch 0: king's full multishot, in-place on the primary repo (unchanged).
+    _b0 = _solve_with_safety_net(**base_kwargs)
+
+    if _b1_thread is None:
+        return _b0
+
+    _b0patch = (_b0.get("patch") or "")
+    try:
+        _s0 = _patch_duel_score(_b0patch, issue)
+    except Exception:
+        _s0 = 0
+
+    # FLOOR INVARIANT: the primary tree always holds a complete, non-empty patch
+    # -- branch 0's to start, then the latest branch-1 best we publish. _disk_*
+    # tracks it so the returned result's patch matches what is physically on disk.
+    _disk_patch, _disk_score = _b0patch, _s0
+
+    # Atomic-publish staging tree on the SAME filesystem as primary, so a new
+    # best can be swapped in with ZERO empty-tree window (renameat2 EXCHANGE),
+    # safe at ANY time. If staging/syscall is unavailable we fall back to the
+    # windowed in-place swap (option-1 behaviour: full extension, ~1% risk).
+    _stage = _copy_repo_same_fs(_primary) if _primary is not None else None
+    _atomic = _stage is not None
+
+    def _publish(patch_text: str, fallback: str) -> bool:
+        if _atomic and _stage:
+            return _atomic_publish(_primary, _stage, patch_text)
+        # Windowed fallback (no same-fs stage): apply the same Fix A veto when we
+        # can verify cheaply — branch-1's returned patch is already applied in
+        # _b1_copy. (A sink checkpoint that differs is published without the veto;
+        # the atomic path above is the common case and is always vetoed.)
+        if _b1_copy and patch_text == ((_b1.get("result") or {}).get("patch") or ""):
+            try:
+                if _branch1_ship_blocked(Path(_b1_copy), patch_text):
+                    return False
+            except Exception:
+                pass
+        return _checkpoint_swap_to_primary(_primary, patch_text, fallback)
+
+    # While branch 1 extends (full timeout) on its isolated copy, publish its
+    # best clean checkpoint to the primary tree as it improves, so a kill at any
+    # moment collects the LATEST best (branch-1 partial work, not just branch 0).
+    if _primary is not None and _init_head:
+        _deadline = _started + _BRANCH1_WALL_CEILING
+        while _b1_thread.is_alive() and time.monotonic() < _deadline:
+            _b1_thread.join(timeout=_CHECKPOINT_POLL_SECONDS)
+            _best = _b1_sink.get("best")
+            if not _best:
+                continue
+            _bsc, _bpt = _best
+            if isinstance(_bpt, str) and _bpt.strip() and _bsc > _disk_score:
+                if _publish(_bpt, _disk_patch):
+                    _disk_patch, _disk_score = _bpt, _bsc
+
+    # Best-of across branch 1's returned patch AND its best published checkpoint.
+    try:
+        _remaining = max(0.0, _BRANCH1_WALL_CEILING - (time.monotonic() - _started))
+        _b1_thread.join(timeout=_remaining)
+        _b1res = _b1.get("result") or {}
+        _cands = [(_b1res.get("patch") or "")]
+        _best = _b1_sink.get("best")
+        if _best and isinstance(_best[1], str):
+            _cands.append(_best[1])
+        _winp, _wins = "", -1
+        for _p in _cands:
+            if _p.strip():
+                try:
+                    _sc = _patch_duel_score(_p, issue)
+                except Exception:
+                    _sc = -1
+                if _sc > _wins:
+                    _winp, _wins = _p, _sc
+        # Publish branch 1's winner only if it beats the on-disk patch; the
+        # swap (atomic, or windowed fallback) leaves the current floor in place
+        # on any failure, so the tree is never empty/worse than branch 0.
+        if (
+            _winp.strip() and _wins > _disk_score
+            and _primary is not None and _init_head
+            and _publish(_winp, _disk_patch)
+        ):
+            _disk_patch, _disk_score = _winp, _wins
+    except Exception:
+        pass
+
+    _cleanup_branch_copy(_b1_copy)
+    if _stage:
+        shutil.rmtree(_stage, ignore_errors=True)  # holds swapped-out content, not primary
+    # Return the result whose patch matches what is physically on disk.
+    if _disk_patch == _b0patch:
+        return _b0
+    _winres = dict(_b1.get("result") or {}) or dict(_b0)
+    _winres["patch"] = _disk_patch
+    _winres["branch1_won"] = True
+    return _winres
 
 
 # -----------------------------
@@ -12747,6 +13463,16 @@ def _run_agentless_pipeline(**kwargs: Any) -> Dict[str, Any]:
         baseline_failing = _run_failing_tests_baseline(
             repo, likely_tests, timeout_seconds=6, max_tests=2,
         ) if likely_tests else []
+        # If the baseline suite is unrunnable here (no loader / missing dep),
+        # drop it: validating pipeline candidates against tests that can't
+        # execute is meaningless and just burns time re-running them per
+        # candidate. Fall back to the execution-free reward / consensus signals.
+        if _baseline_failure_reason_if_nonactionable(baseline_failing):
+            logs.append(
+                "GPS_BASELINE_NONACTIONABLE: tests unrunnable in sandbox -- "
+                "skipping test-based candidate validation"
+            )
+            baseline_failing = []
 
         initial_head = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=str(repo),
@@ -13045,8 +13771,17 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                             result["patch"] = _clean
                             result["patch_validity_fallback"] = "clean_working_tree"
                     if not _patch_well_formed(result["patch"]):
-                        result["patch"] = ""
-                        result["success"] = False
+                        # FP guard: `_patch_well_formed` has a real false-positive
+                        # tail (~20% of its flag-and-void cases were valid git
+                        # diffs). Only void if git ALSO cannot reverse-apply the
+                        # patch to the tree (genuinely not the tree's diff). A
+                        # patch git accepts is kept rather than shipped empty == 0.
+                        if not (
+                            _multishot_repo_obj is not None
+                            and _patch_reverse_applies(_multishot_repo_obj, result["patch"])
+                        ):
+                            result["patch"] = ""
+                            result["success"] = False
                 except Exception:
                     pass
             # Two-tier salvage: never ship `success=False AND empty patch`
@@ -13486,6 +14221,13 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     ship_blocker_nudges_used = 0
     verification_nudges_used = 0
     last_verification_step = 0
+    # Branch-1 checkpoint/resume: keep the best-scored clean patch and (when the
+    # caller enables full-timeout) extend the soft budget up to _hard_return_budget.
+    _checkpoint_resume = bool(kwargs.get("_checkpoint_resume", False))
+    _hard_return_budget = float(kwargs.get("_hard_return_budget", wall_clock_budget))
+    _checkpoint_sink = kwargs.get("_checkpoint_sink")  # shared dict; driver swaps onto primary
+    _best_clean_patch = ""
+    _best_clean_score = -1
     known_test_node_ids: List[str] = []
     last_failed_test_names: List[str] = []
     recent_command_sigs: List[str] = []
@@ -13640,6 +14382,8 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
 
         def _try_test_refinement_gate() -> bool:
             nonlocal test_fix_turns_used, total_refinement_turns_used
+            if _nonactionable_test_env:
+                return False  # tests are unrunnable here — never chase the runner
             if test_fix_turns_used >= MAX_TEST_FIX_TURNS:
                 return False
             test_failure: Optional[Tuple[str, str]] = None
@@ -13807,6 +14551,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         # the probe can't starve the action loop. Best-effort — empty
         # results just leave the prompt unchanged.
         _baseline_failing_tests: List[Tuple[str, str]] = []
+        _nonactionable_test_env = False
         if _likely_tests and time_remaining() > 200.0:
             _baseline_t0 = time.monotonic()
             _baseline_failing_tests = _run_failing_tests_baseline(
@@ -13818,6 +14563,27 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 f"failing={len(_baseline_failing_tests)} "
                 f"elapsed={time.monotonic() - _baseline_t0:.1f}s"
             )
+            # If every surfaced baseline failure is a non-runnable tooling/env
+            # error (no TS loader, missing dep, no network), "make these tests
+            # pass" is the wrong framing — it makes the model rabbit-hole on the
+            # test runner and never implement the issue (real loss: task 065512,
+            # ~all steps on vitest.config for ERR_UNKNOWN_FILE_EXTENSION, zero
+            # features). Drop them so they are neither surfaced nor refined, and
+            # tell the model to implement the issue directly.
+            _nonactionable_reason = _baseline_failure_reason_if_nonactionable(
+                _baseline_failing_tests
+            )
+            if _nonactionable_reason:
+                logs.append(
+                    "BASELINE_TESTS_NONACTIONABLE: "
+                    f"reason={_nonactionable_reason} -- _format_failing_tests_section "
+                    "reframes them as sandbox noise; disabling test-refinement gate; "
+                    "implement issue directly"
+                )
+                # Keep _baseline_failing_tests populated: the section renders them
+                # REFRAMED (sandbox noise, implement the issue) and the ranking
+                # boost still benefits. The gate is what we must stop (below).
+                _nonactionable_test_env = True
 
         # Boost file ranking by appending failing test paths to the issue used for context loading
         ranking_issue = issue
@@ -13894,6 +14660,37 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 initial_preload_stripped = True
 
             if out_of_time():
+                if _checkpoint_resume:
+                    # Snapshot the best-scored coherent patch as the clean
+                    # fallback, and publish it for the driver to swap onto the
+                    # primary repo (so a timeout-kill collects this checkpoint).
+                    try:
+                        _cp = get_patch(repo)
+                        if _cp.strip():
+                            _cs = _patch_duel_score(_cp, issue)
+                            if _cs > _best_clean_score:
+                                _best_clean_score, _best_clean_patch = _cs, _cp
+                                if isinstance(_checkpoint_sink, dict):
+                                    _checkpoint_sink["best"] = (_best_clean_score, _best_clean_patch)
+                    except Exception:
+                        pass
+                    # Resume: extend the soft budget and keep the work history,
+                    # as long as the next step stays within the hard return
+                    # budget (held under the docker wall by the caller).
+                    if (
+                        not success
+                        and wall_clock_budget + _CHECKPOINT_EXTENSION_SECONDS <= _hard_return_budget
+                    ):
+                        wall_clock_budget += _CHECKPOINT_EXTENSION_SECONDS
+                        logs.append(
+                            f"CHECKPOINT_EXTEND:\n+{_CHECKPOINT_EXTENSION_SECONDS:.0f}s "
+                            f"budget={wall_clock_budget:.0f}s hard={_hard_return_budget:.0f}s "
+                            f"best_clean_lines={len(_best_clean_patch.splitlines())}"
+                        )
+                        messages.append(
+                            {"role": "user", "content": build_budget_pressure_prompt(step)}
+                        )
+                        continue
                 logs.append(
                     f"WALL_CLOCK_STOP:\nremaining={time_remaining():.1f}s "
                     f"reserve={WALL_CLOCK_RESERVE_SECONDS:.1f}s -- "
@@ -14221,6 +15018,18 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         if repo is not None:
             _gofmt_changed_go_files(repo)  # final-only: gofmt-clean the Go we ship
         patch = get_patch(repo)
+        # Branch-1 checkpoint/resume: if an earlier checkpoint scored higher than
+        # the current (possibly mid-edit) tree, ship that clean checkpoint.
+        if _checkpoint_resume and _best_clean_patch.strip():
+            try:
+                if _patch_duel_score(patch, issue) < _best_clean_score:
+                    patch = _best_clean_patch
+                    logs.append(
+                        f"CHECKPOINT_RETURN:\nshipping best clean checkpoint "
+                        f"(score={_best_clean_score}, lines={len(patch.splitlines())})"
+                    )
+            except Exception:
+                pass
         if patch.strip() and not success:
             logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
             success = True
