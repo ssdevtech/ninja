@@ -12902,6 +12902,13 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                 if stripped != result["patch"]:
                     result["patch"] = stripped
                     result["lockfile_stripped"] = True
+                try:
+                    sanitized = _sanitize_patch(result["patch"])
+                    if sanitized != result["patch"]:
+                        result["patch"] = sanitized
+                        result["patch_sanitized"] = True
+                except Exception:
+                    pass
                 dropped = _drop_malformed_diff_blocks(result["patch"])
                 if dropped != result["patch"]:
                     result["patch"] = dropped
@@ -13019,6 +13026,9 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                         if _clean.strip() and _patch_well_formed(_clean):
                             result["patch"] = _clean
                             result["patch_validity_fallback"] = "clean_working_tree"
+                    if not _patch_well_formed(result["patch"]):
+                        result["patch"] = ""
+                        result["success"] = False
                 except Exception:
                     pass
             # Two-tier salvage: never ship `success=False AND empty patch`
@@ -13300,7 +13310,22 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
         if _winner_patch and _multishot_repo_obj is not None:
-            _multishot_apply_patch(_multishot_repo_obj, _winner_patch)
+            _apply_patch = _winner_patch
+            try:
+                _sanitized_patch = _sanitize_patch(_apply_patch)
+                if _sanitized_patch.strip():
+                    _apply_patch = _sanitized_patch
+            except Exception:
+                pass
+            try:
+                if not _patch_well_formed(_apply_patch):
+                    _repaired_patch = _repair_hunk_header_counts(_apply_patch)
+                    if _repaired_patch.strip():
+                        _apply_patch = _repaired_patch
+            except Exception:
+                pass
+            if _patch_well_formed(_apply_patch):
+                _multishot_apply_patch(_multishot_repo_obj, _apply_patch)
 
         try:
             _augmented_patch = _coverage_closure_pass(
@@ -13350,10 +13375,25 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                 ),
             )
             if _picked_patch != _winner_patch:
-                if _multishot_repo_obj is not None and _multishot_initial_head:
-                    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-                    _multishot_apply_patch(_multishot_repo_obj, _picked_patch)
-                _winner_result["patch"] = _picked_patch
+                _handoff_patch = _picked_patch
+                try:
+                    _sanitized_handoff = _sanitize_patch(_handoff_patch)
+                    if _sanitized_handoff.strip():
+                        _handoff_patch = _sanitized_handoff
+                except Exception:
+                    pass
+                try:
+                    if not _patch_well_formed(_handoff_patch):
+                        _repaired_handoff = _repair_hunk_header_counts(_handoff_patch)
+                        if _repaired_handoff.strip():
+                            _handoff_patch = _repaired_handoff
+                except Exception:
+                    pass
+                if _patch_well_formed(_handoff_patch):
+                    if _multishot_repo_obj is not None and _multishot_initial_head:
+                        _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+                        _multishot_apply_patch(_multishot_repo_obj, _handoff_patch)
+                    _winner_result["patch"] = _handoff_patch
             if _picked_label == "gps":
                 _winner_result["multishot_winner"] = "gps_over_react"
 
