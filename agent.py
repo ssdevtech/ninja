@@ -13682,25 +13682,12 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                             result["patch"] = _stripped
                             result["empty_stub_files_stripped"] = _empty_paths
                 # Post-finalize defect linters (additive, no model calls)
+                # First run all destructive/structural cleanups (line dropping) to simplify the patch content early.
                 try:
-                    _m1 = _dedupe_duplicate_function_decls(result["patch"])
-                    if _m1 != result["patch"] and _m1.strip():
-                        result["patch"] = _m1
-                        result["dedup_fn_decls_applied"] = True
-                except Exception:
-                    pass
-                try:
-                    _m2 = _ensure_use_client_directive(result["patch"])
-                    if _m2 != result["patch"] and _m2.strip():
-                        result["patch"] = _m2
-                        result["use_client_prepended"] = True
-                except Exception:
-                    pass
-                try:
-                    _m3 = _dedupe_duplicate_imports(result["patch"])
-                    if _m3 != result["patch"] and _m3.strip():
-                        result["patch"] = _m3
-                        result["dedup_imports_applied"] = True
+                    _m6 = _strip_binary_artifacts_from_patch(result["patch"])
+                    if _m6 != result["patch"] and _m6.strip():
+                        result["patch"] = _m6
+                        result["binary_artifacts_stripped"] = True
                 except Exception:
                     pass
                 try:
@@ -13717,19 +13704,36 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
                         result["self_imports_dropped"] = True
                 except Exception:
                     pass
-                # --- Ported autofixes (silent correctness) ---
-                try:
-                    _m6 = _strip_binary_artifacts_from_patch(result["patch"])
-                    if _m6 != result["patch"] and _m6.strip():
-                        result["patch"] = _m6
-                        result["binary_artifacts_stripped"] = True
-                except Exception:
-                    pass
                 try:
                     _m7 = _autofix_drop_unsolicited_return_deletion_hunks(result["patch"])
                     if _m7 != result["patch"] and _m7.strip():
                         result["patch"] = _m7
                         result["return_deletion_hunks_dropped"] = True
+                except Exception:
+                    pass
+
+                # Next run deduplication
+                try:
+                    _m1 = _dedupe_duplicate_function_decls(result["patch"])
+                    if _m1 != result["patch"] and _m1.strip():
+                        result["patch"] = _m1
+                        result["dedup_fn_decls_applied"] = True
+                except Exception:
+                    pass
+                try:
+                    _m3 = _dedupe_duplicate_imports(result["patch"])
+                    if _m3 != result["patch"] and _m3.strip():
+                        result["patch"] = _m3
+                        result["dedup_imports_applied"] = True
+                except Exception:
+                    pass
+
+                # Then run constructive/additive autofixes (which inject/modify strings)
+                try:
+                    _m2 = _ensure_use_client_directive(result["patch"])
+                    if _m2 != result["patch"] and _m2.strip():
+                        result["patch"] = _m2
+                        result["use_client_prepended"] = True
                 except Exception:
                     pass
                 try:
