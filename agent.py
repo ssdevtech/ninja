@@ -8773,17 +8773,28 @@ def _patch_duel_score(patch: str, issue: str) -> int:
     """Rank candidate patches for multishot winner selection (higher is better)."""
     if not patch.strip():
         return 0
-    score = _multishot_count_substantive(patch) * 10
+    # 1. Base score on substantive lines, but scaled down so it doesn't swamp correctness.
+    score = _multishot_count_substantive(patch) * 3
+    
+    # 2. Path coverage bonus (highly important)
     if _patch_covers_required_paths(patch, issue):
-        score += 30
+        score += 50
+        
+    # 3. Direct, uncapped penalty for unaddressed criteria to prioritize completeness.
     unaddressed = _unaddressed_criteria(patch, issue)
-    score += max(0, 35 - 12 * len(unaddressed))
+    score += 40 - 25 * len(unaddressed)
+    
+    # 4. Deletion requirement bonus
     if _issue_requires_deletion(issue):
         if _patch_has_deletions(patch):
-            score += 20
+            score += 30
+            
+    # 5. Relocation requirement bonus
     if _issue_implies_relocation(issue) and _patch_creates_any_new_file(patch):
-        score += 25
-    score -= 18 * len(_patch_ship_blockers(patch, issue))
+        score += 35
+        
+    # 6. Massive, severe penalty for ship blockers (syntax/build-breakers) to prioritize runnable code.
+    score -= 100 * len(_patch_ship_blockers(patch, issue))
     return score
 
 
@@ -13763,12 +13774,22 @@ def solve(
             # well-formed hardening, so it is not separately repaired here.)
             _bo["branch1_size_winner"] = True
             _cand = _winp
+            # Run the finalize passes on the raw _winp first to clean it up.
+            try:
+                _cleaned_b1, _b1tele = _finalize_patch_text_passes(_cand, issue)
+                if _cleaned_b1.strip() and _cleaned_b1 != _cand:
+                    _cand = _cleaned_b1
+                    if _b1tele:
+                        _bo["branch1_finalize_passes"] = _b1tele
+            except Exception:
+                pass
+            # Now run _final_defect_repair on the cleaned candidate _cand instead of raw _winp.
             try:
                 if _stage and (time.monotonic() - _started) < (_BRANCH1_HARD_WALL_CEILING - 45.0):
                     _bo["repair_attempted"] = True
                     _repair_detail: Dict[str, Any] = {}
                     _rep = _final_defect_repair(
-                        issue, _winp, _stage, model, api_base, api_key,
+                        issue, _cand, _stage, model, api_base, api_key,
                         timeout=int(
                             max(15.0, min(40.0,
                                 _started + _BRANCH1_HARD_WALL_CEILING - time.monotonic() - 24.0))
@@ -13780,19 +13801,14 @@ def solve(
                         _cand = _rep  # the judge now sees the repaired branch 1
                         _bo["repair_adopted"] = True
             except Exception:
-                _cand = _winp
-            # Branch-1 deterministic cleanup — parity with branch 0's _finalize,
-            # which branch 1 SKIPS (it is a raw _solve_attempt). Run the SAME
-            # shared patch-text passes (scope-drop, lockfile/sanitize/malformed/
-            # hunk-repair, empty-stub strip, no-model linters) on the candidate.
-            # Guard: only adopt a non-empty result (the strip could empty a
-            # pure-stub patch; branch 1 has no salvage net, so keep _cand then).
+                pass
+            # Run the finalize passes on the repaired/modified candidate one more time to ensure strict correctness.
             try:
-                _cleaned_b1, _b1tele = _finalize_patch_text_passes(_cand, issue)
-                if _cleaned_b1.strip() and _cleaned_b1 != _cand:
-                    _cand = _cleaned_b1
-                    if _b1tele:
-                        _bo["branch1_finalize_passes"] = _b1tele
+                _cleaned_b1_final, _b1tele_final = _finalize_patch_text_passes(_cand, issue)
+                if _cleaned_b1_final.strip() and _cleaned_b1_final != _cand:
+                    _cand = _cleaned_b1_final
+                    if _b1tele_final and not _bo.get("branch1_finalize_passes"):
+                        _bo["branch1_finalize_passes"] = _b1tele_final
             except Exception:
                 pass
             # Low-signal floor override: branch 0 SELF-CERTIFIED WEAK this round.
@@ -13807,13 +13823,17 @@ def solve(
             # branch 1 if it clears the veto, else the publish no-ops and the
             # existing floor stays. Deterministic trigger; no new build-break risk.
             _skip_floor_judge = False
-            if _b0.get("multishot_skipped_retry"):
-                try:
-                    if _multishot_count_substantive(_cand) > _multishot_count_substantive(_b0patch):
-                        _skip_floor_judge = True
-                        _bo["floor_low_signal_override"] = _b0.get("multishot_skipped_retry")
-                except Exception:
-                    _skip_floor_judge = False
+            try:
+                _b0_sub = _multishot_count_substantive(_b0patch)
+                _cand_sub = _multishot_count_substantive(_cand)
+                if _b0_sub < _MULTISHOT_LOW_SIGNAL_THRESHOLD and _cand_sub > _b0_sub:
+                    _skip_floor_judge = True
+                    _bo["floor_low_signal_override"] = f"floor_weak_sub_{_b0_sub}"
+                elif _b0.get("multishot_skipped_retry") and _cand_sub > _b0_sub:
+                    _skip_floor_judge = True
+                    _bo["floor_low_signal_override"] = _b0.get("multishot_skipped_retry")
+            except Exception:
+                _skip_floor_judge = False
             # Judge: branch 0 (clean floor) vs the (possibly repaired) branch 1.
             # ONLY a "floor is better" verdict blocks the override; error / None /
             # no-time falls back to the size pick (publish _cand). Skip near wall.
@@ -15287,21 +15307,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     )
                 initial_preload_stripped = True
 
+            if _checkpoint_resume:
+                # Snapshot the best-scored coherent patch as the clean
+                # fallback, and publish it for the driver to swap onto the
+                # primary repo (so a timeout-kill collects this checkpoint).
+                try:
+                    _cp = get_patch(repo)
+                    if _cp.strip():
+                        _cs = _patch_duel_score(_cp, issue)
+                        if _cs > _best_clean_score:
+                            _best_clean_score, _best_clean_patch = _cs, _cp
+                            if isinstance(_checkpoint_sink, dict):
+                                _checkpoint_sink["best"] = (_best_clean_score, _best_clean_patch)
+                except Exception:
+                    pass
+
             if out_of_time():
                 if _checkpoint_resume:
-                    # Snapshot the best-scored coherent patch as the clean
-                    # fallback, and publish it for the driver to swap onto the
-                    # primary repo (so a timeout-kill collects this checkpoint).
-                    try:
-                        _cp = get_patch(repo)
-                        if _cp.strip():
-                            _cs = _patch_duel_score(_cp, issue)
-                            if _cs > _best_clean_score:
-                                _best_clean_score, _best_clean_patch = _cs, _cp
-                                if isinstance(_checkpoint_sink, dict):
-                                    _checkpoint_sink["best"] = (_best_clean_score, _best_clean_patch)
-                    except Exception:
-                        pass
                     # Resume: extend the soft budget and keep the work history,
                     # as long as the next step stays within the hard return
                     # budget (held under the docker wall by the caller).
