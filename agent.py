@@ -1812,6 +1812,11 @@ _SKELETON_INDEX_MAX_FILES = 220
 _SKELETON_READ_MAX_BYTES = 120_000
 _LOCALIZE_BM25_WEIGHT = 0.55
 _LOCALIZE_TFIDF_WEIGHT = 0.45
+# LEVER-1b weight: how strongly the deterministic _rank_context_files integer
+# score (path-mention/error-string/symbol-grep) is preserved through the
+# lexical rerank. 120 > loc's max 100 so a max-signal file (full path mention)
+# cannot be demoted below a pure-lexical distractor.
+_BASE_SCORE_RERANK_WEIGHT = 120.0
 _LOCALIZE_TOP_SYMBOLS_PER_FILE = 5
 _LOCALIZE_SYMBOL_CTX_BEFORE = 6
 _LOCALIZE_SYMBOL_CTX_AFTER = 18
@@ -2027,9 +2032,38 @@ def _extract_file_skeleton(repo: Path, relative_path: str) -> Optional[FileSkele
     return FileSkeleton(path=relative_path, symbols=symbols, index_text=index_text)
 
 
-def _build_repo_symbol_index(repo: Path, tracked: set) -> Dict[str, FileSkeleton]:
+def _build_repo_symbol_index(repo: Path, tracked: set, issue: Optional[str] = None) -> Dict[str, FileSkeleton]:
     index: Dict[str, FileSkeleton] = {}
-    paths = sorted(p for p in tracked if _context_file_allowed(p))[:_SKELETON_INDEX_MAX_FILES]
+    allowed = [p for p in tracked if _context_file_allowed(p)]
+    if issue:
+        # LEVER-1a: fill the (fixed-size) skeleton budget RELEVANCE-FIRST instead
+        # of alphabetically. On repos with > _SKELETON_INDEX_MAX_FILES files the
+        # plain `sorted(...)[:N]` truncation drops every file sorting past N
+        # alphabetically -> those files get no skeleton -> no RAPTOR chunk -> are
+        # never preloaded -> guaranteed incompleteness on multi-file tasks. Ranking
+        # the allowed set by cheap issue-string relevance first (no skeletons
+        # needed, pure str ops) keeps the SAME budget/latency but guarantees
+        # issue-relevant files are among the indexed ones.
+        il = issue.lower()
+        toks = set(re.findall(r"[a-z0-9_]{3,}", il))
+
+        def _rel(p: str) -> int:
+            pl = p.lower()
+            nm = Path(p).name.lower()
+            st = Path(p).stem.lower()
+            r = 0
+            if pl in il:
+                r += 4
+            if nm and nm in il:
+                r += 3
+            if st and len(st) >= 3 and st in toks:
+                r += 2
+            return r
+
+        allowed = sorted(allowed, key=lambda p: (-_rel(p), p))
+    else:
+        allowed = sorted(allowed)
+    paths = allowed[:_SKELETON_INDEX_MAX_FILES]
     for rel in paths:
         sk = _extract_file_skeleton(repo, rel)
         if sk:
@@ -2159,6 +2193,7 @@ def _multistep_localize_file_ranking(
     issue_text: str,
     base_ranked: List[str],
     index: Dict[str, FileSkeleton],
+    score_map: Optional[Dict[str, int]] = None,
 ) -> Tuple[List[str], int]:
     """Coarse file pass: BM25 + TF-IDF over symbol index, merged with base rank."""
     if not index or not base_ranked:
@@ -2169,11 +2204,27 @@ def _multistep_localize_file_ranking(
     bm25 = _normalize_score_map(_bm25_file_scores(qterms, index))
     tfidf = _normalize_score_map(_tfidf_cosine_file_scores(qterms, index))
     position: Dict[str, int] = {p: i for i, p in enumerate(base_ranked)}
+    # LEVER-1b: preserve the strong DETERMINISTIC ranking evidence from
+    # _rank_context_files (explicit path-mention +100, exact error-string up to
+    # +130, symbol-grep +60..100). The original rerank discarded it entirely and
+    # re-sorted on lexical loc + a position bonus that decays at 0.04/rank and
+    # FLOORS at rank 25 -> a lexically-similar distractor could leapfrog a file
+    # the issue explicitly names. Folding the normalized base score back in (as an
+    # additive term) keeps the high-signal files dominant. Pure arithmetic.
+    _max_base = 0
+    if score_map:
+        try:
+            _max_base = max(score_map.values())
+        except ValueError:
+            _max_base = 0
     combined: Dict[str, float] = {}
     for path in set(base_ranked) | set(index.keys()):
         loc = _LOCALIZE_BM25_WEIGHT * bm25.get(path, 0.0) + _LOCALIZE_TFIDF_WEIGHT * tfidf.get(path, 0.0)
         pos_bonus = max(0.0, 1.0 - 0.04 * position.get(path, 99))
-        combined[path] = loc * 100.0 + pos_bonus * 40.0
+        base_term = 0.0
+        if _max_base > 0:
+            base_term = (score_map.get(path, 0) / _max_base) * _BASE_SCORE_RERANK_WEIGHT
+        combined[path] = loc * 100.0 + pos_bonus * 40.0 + base_term
     ordered = sorted(combined.items(), key=lambda kv: (-kv[1], position.get(kv[0], 999), kv[0]))
     ranked = [p for p, _ in ordered if p in index or p in position]
     seen: set = set()
@@ -3125,7 +3176,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     except Exception:
         issue_symbols = []
     search_issue = issue if not issue_symbols else issue + '\n' + '\n'.join(issue_symbols)
-    symbol_index = _build_repo_symbol_index(repo, tracked_set)
+    symbol_index = _build_repo_symbol_index(repo, tracked_set, search_issue)
     _SOLVE_TLS.preload_frames = _extract_trace_frames(issue, tracked_set)
     fault_sites = list(_SOLVE_TLS.preload_frames)
     graph_nodes, graph_edges = _build_repo_graph(repo, symbol_index)
@@ -3467,7 +3518,12 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
         top_score = max(top_score, 100)
     idx = _get_symbol_index_for_ranking()
     if idx:
-        reranked, loc_top = _multistep_localize_file_ranking(issue, ranked, idx)
+        # LEVER-1b: thread the deterministic integer scores into the rerank so
+        # explicit path-mention / error-string / symbol-grep evidence survives.
+        _score_map: Dict[str, int] = {s_p[1]: s_p[0] for s_p in scored}
+        for _m in mentioned:
+            _score_map[_m] = max(_score_map.get(_m, 0), 100)
+        reranked, loc_top = _multistep_localize_file_ranking(issue, ranked, idx, _score_map)
         if reranked:
             ranked = reranked
             top_score = max(top_score, loc_top)
@@ -8493,7 +8549,26 @@ def build_lgxl_coverage_addendum(reasons: str) -> str:
         "Coverage strategy: cover as many of the implied required files as "
         "you can within budget. Each file's edit must contribute real "
         "functionality — never regress an existing file to an empty or "
-        "stub state.\n"
+        "stub state.\n\n"
+        # LEVER-4 (anti-bug self-check): the dominant retest loss driver is
+        # COMPILE-FATAL correctness bugs INSIDE in-scope files that the
+        # sandbox's static gates miss (no node/tsc/go/rustc). Force a
+        # deterministic self-review using reads the model ALREADY does (grep/
+        # sed) — no new verification passes, no extra LLM round-trips.
+        "Correctness self-check — before <final>, re-read each file you "
+        "edited (you already grep/sed these) and verify, fixing any issue "
+        "in place: (a) it still PARSES in its own language — no "
+        "`async with open(...)` (open() is not an async context manager), no "
+        "duplicate/stray `[[package]]` or lockfile headers, no unbalanced "
+        "braces/tags, no stray duplicate `def`/`class`; (b) every module "
+        "path you import ACTUALLY EXISTS in the repo (confirm with grep) and "
+        "you did not break or rename an existing import; (c) you used the "
+        "EXACT identifiers, string literals, test-ids and column/field names "
+        "that already appear in the issue and surrounding code — never a "
+        "plausible synonym; (d) you did NOT add unrequested tests, "
+        "persistence, error templates, or .gitignore/lockfile churn the "
+        "issue did not ask for. This is verification, not removal: never "
+        "delete a correct edit.\n"
     )
 
 
@@ -10580,7 +10655,7 @@ If preloaded snippets show the target code, edit with `<edit>` immediately — d
 
 When multiple files need edits, include EVERY `<edit>` and `<command>` block needed in the SAME response. Do not split edits across turns.
 
-After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./pkg/foo -count=1`, etc.). Then finish with <final>...</final>.{lgxl_addendum}"""
+After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./pkg/foo -count=1`, etc.). Before you finish, confirm each edited file still parses and that every module path you import and every identifier/string/test-id you reference actually EXISTS in the repo (use the grep/sed reads you already do) — use the exact existing names, never a plausible synonym, and do not add churn the issue did not ask for. Then finish with <final>...</final>.{lgxl_addendum}"""
 
 
 
@@ -14745,25 +14820,60 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         if len(winner_cluster) < 2 and len(candidates) >= 2:
             _winner_result["multishot_low_confidence"] = True
 
+        # LEVER-3 (tree-hygiene, never-empty): the original code UNCONDITIONALLY
+        # reverted the scored tree to base, then skipped the re-apply when the
+        # winner was empty/malformed -> a timeout-kill in/after that window
+        # collected an EMPTY 0-line diff and lost the both-timeout round
+        # (observed: retest 6452 shipped 3 empty partials = the dominant -9
+        # both-TLE deficit). Now: prepare the well-formed apply patch FIRST,
+        # only revert when we actually have one to re-apply, and if the apply
+        # leaves the tree empty, restore the best complete patch we held — so the
+        # scored tree is NEVER left empty without a successful re-apply.
+        # Latency-neutral: reorders existing ops, no repo copy.
         if _multishot_repo_obj is not None:
-            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        if _winner_patch and _multishot_repo_obj is not None:
-            _apply_patch = _winner_patch
+            _apply_patch = _winner_patch or ""
+            if _apply_patch.strip():
+                try:
+                    _sanitized_patch = _sanitize_patch(_apply_patch)
+                    if _sanitized_patch.strip():
+                        _apply_patch = _sanitized_patch
+                except Exception:
+                    pass
+                try:
+                    if not _patch_well_formed(_apply_patch):
+                        _repaired_patch = _repair_hunk_header_counts(_apply_patch)
+                        if _repaired_patch.strip():
+                            _apply_patch = _repaired_patch
+                except Exception:
+                    pass
+            # floor: the complete patch already on the tree (last attempt).
+            _pre_revert_patch = ""
             try:
-                _sanitized_patch = _sanitize_patch(_apply_patch)
-                if _sanitized_patch.strip():
-                    _apply_patch = _sanitized_patch
+                _pre_revert_patch = get_patch(_multishot_repo_obj) or ""
             except Exception:
-                pass
-            try:
-                if not _patch_well_formed(_apply_patch):
-                    _repaired_patch = _repair_hunk_header_counts(_apply_patch)
-                    if _repaired_patch.strip():
-                        _apply_patch = _repaired_patch
-            except Exception:
-                pass
-            if _patch_well_formed(_apply_patch):
-                _multishot_apply_patch(_multishot_repo_obj, _apply_patch)
+                _pre_revert_patch = ""
+            if _apply_patch.strip() and _patch_well_formed(_apply_patch):
+                _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+                try:
+                    _multishot_apply_patch(_multishot_repo_obj, _apply_patch)
+                except Exception:
+                    pass
+                # never-empty guard: if the tree went empty the winner FAILED to
+                # apply, so restore the complete patch that was on the tree
+                # before (the floor) — NOT the winner (which just failed). Never
+                # leave the scored tree empty.
+                try:
+                    if not (get_patch(_multishot_repo_obj) or "").strip():
+                        if _pre_revert_patch.strip():
+                            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+                            try:
+                                _multishot_apply_patch(_multishot_repo_obj, _pre_revert_patch)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            # else: no well-formed winner -> do NOT revert; keep the complete
+            # patch already on the tree so a kill never collects an empty diff.
 
         try:
             _augmented_patch = _coverage_closure_pass(
@@ -15424,12 +15534,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
                 try:
+                    # LEVER-2: clamp the per-step LLM timeout to the remaining
+                    # wall (minus reserve) so a late call can't run the default
+                    # 120s PAST the container hard-kill -> killed mid-stream ->
+                    # truncated/empty partial that loses the timeout race. On the
+                    # retest pool we timed out 30x vs king 23x and shipped 3
+                    # empty 0-line patches; bounding the call converts "killed
+                    # mid-overrun" into "graceful stop with a complete patch".
+                    # 20s floor so we never pass a too-small timeout that would
+                    # truncate a productive step.
+                    _step_timeout = int(max(20.0, min(120.0, time_remaining() - WALL_CLOCK_RESERVE_SECONDS)))
                     response_text, cost, _raw = chat_completion(
                         messages=_messages_for_request(messages),
                         model=model_name,
                         api_base=api_base,
                         api_key=api_key,
                         max_tokens=max_tokens,
+                        timeout=_step_timeout,
                     )
                     if cost is not None and total_cost is not None:
                         total_cost += cost
