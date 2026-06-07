@@ -828,6 +828,11 @@ def _fuzzy_locate(src: str, old: str) -> Optional[Tuple[int, int]]:
     """If verbatim match fails, try a normalized match. Returns (start, end)
     offsets in the ORIGINAL source so the splice preserves real bytes around
     the matched region. Only succeeds when normalized match is unique.
+
+    Multi-line fallback: when the standard normalized match fails AND the
+    target spans 2+ lines, retry with lstrip on each line on BOTH sides. This
+    recovers indent-drift cases (model emits an <old> block at the wrong
+    indentation level) without sacrificing single-line uniqueness.
     """
     n_old = _norm_for_fuzzy(old)
     if not n_old.strip():
@@ -839,6 +844,15 @@ def _fuzzy_locate(src: str, old: str) -> Optional[Tuple[int, int]]:
     for i in range(len(n_lines) - len(target) + 1):
         if n_lines[i:i + len(target)] == target:
             matches.append(i)
+    if len(matches) == 0 and len(target) >= 2:
+        # Indent-tolerant retry: strip leading whitespace per-line on both
+        # sides. Multi-line gated so single-line edits keep their strict
+        # uniqueness (matching "x = 1" anywhere in a file is FP-prone).
+        t_lstrip = [ln.lstrip() for ln in target]
+        n_lstrip = [ln.lstrip() for ln in n_lines]
+        for i in range(len(n_lstrip) - len(t_lstrip) + 1):
+            if n_lstrip[i:i + len(t_lstrip)] == t_lstrip:
+                matches.append(i)
     if len(matches) != 1:
         return None
     i = matches[0]
@@ -862,81 +876,11 @@ def extract_edits(model_text: str) -> List[Dict[str, Any]]:
     ordering."""
     out: List[Dict[str, Any]] = []
 
-    def _unwrap_body(body: str) -> str:
-        if not body:
-            return body
-        prev = None
-        cur = body
-        for _ in range(3):
-            if cur == prev:
-                break
-            prev = cur
-            cur = _strip_wrapping_code_fence(cur, "x.py")
-        return cur
-
-    def _extract_blocks(body: str) -> Dict[str, str]:
-        text = body or ""
-        blocks: Dict[str, str] = {}
-        for candidate in (text, _unwrap_body(text)):
-            blocks = {}
-            for b in _EDIT_BLOCK_RE.finditer(candidate):
-                blocks[b.group(1).lower()] = b.group(2)
-            if blocks:
-                return blocks
-        text = _unwrap_body(text)
-        tag_names = ("content", "new", "old")
-        for name in tag_names:
-            open_pat = re.compile(r"<" + name + r">", re.IGNORECASE)
-            close_pat = re.compile(r"</" + name + r">", re.IGNORECASE)
-            m_open = open_pat.search(text)
-            if not m_open:
-                continue
-            m_close = close_pat.search(text, m_open.end())
-            if m_close:
-                blocks[name] = text[m_open.end():m_close.start()]
-                continue
-            fragment = text[m_open.end():]
-            next_tag = re.search(r"<(?:/)?(?:content|new|old)>", fragment, re.IGNORECASE)
-            if next_tag:
-                blocks[name] = fragment[:next_tag.start()]
-            elif any(re.search(r"</" + other + r">", fragment, re.IGNORECASE) for other in tag_names):
-                blocks[name] = fragment
-        if blocks:
-            if "content" in blocks:
-                content_value = blocks["content"]
-                wrapped_blocks: Dict[str, str] = {}
-                for b in _EDIT_BLOCK_RE.finditer(_unwrap_body(content_value)):
-                    wrapped_blocks[b.group(1).lower()] = b.group(2)
-                if wrapped_blocks and ("old" in wrapped_blocks or "new" in wrapped_blocks):
-                    for key, value in wrapped_blocks.items():
-                        if key not in blocks or not blocks[key].strip():
-                            blocks[key] = value
-                    if ("old" in wrapped_blocks or "new" in wrapped_blocks) and not blocks["content"].strip():
-                        blocks.pop("content", None)
-            return blocks
-        lowered = text.lower()
-        if "<content>" not in lowered and "<new>" not in lowered and "<old>" not in lowered:
-            stripped = text.strip()
-            if stripped:
-                return {"content": stripped}
-        return blocks
-
-    def _normalize_payload(value: str, path: str) -> str:
-        if not value:
-            return value
-        out_value = value
-        prev = None
-        for _ in range(3):
-            if out_value == prev:
-                break
-            prev = out_value
-            out_value = _strip_wrapping_code_fence(out_value, path or "x.py")
-        out_value = _maybe_unescape_code_entities(out_value, path or "x.py")
-        return out_value
-
     def _mk(attr_str: str, body: str, raw: str) -> Dict[str, Any]:
         attrs = _parse_edit_attrs(attr_str)
-        blocks = _extract_blocks(body)
+        blocks: Dict[str, str] = {}
+        for b in _EDIT_BLOCK_RE.finditer(body or ""):
+            blocks[b.group(1).lower()] = b.group(2)
         try:
             line_arg = int(attrs.get("line", "0") or 0)
         except ValueError:
@@ -946,27 +890,22 @@ def extract_edits(model_text: str) -> List[Dict[str, Any]]:
         except ValueError:
             count_arg = 1
         op = (attrs.get("op") or "replace").lower()
-        path = attrs.get("path", "")
         content = blocks.get("content", "")
         new = blocks.get("new", "")
         old = blocks.get("old", "")
+        # Wrong-block recovery: a write/insert whose payload the model put in the
+        # WRONG tag (<new>/<old> instead of <content>) would otherwise silently
+        # write an EMPTY file — a whole deliverable missing (the dominant
+        # incompleteness loss). Adopt the populated block. Gated to content empty
+        # AND another block carrying text, so it never overrides an intentional
+        # empty file (all blocks empty) or a replace's intentional empty <new>.
         if op in ("write", "insert") and not content.strip():
             if new.strip():
                 content = new
             elif old.strip():
                 content = old
-        if op == "replace":
-            if not old.strip() and content.strip():
-                old = content
-            if not new and content:
-                new = content
-        if op == "delete" and not old.strip() and content.strip():
-            old = content
-        content = _normalize_payload(content, path)
-        new = _normalize_payload(new, path)
-        old = _normalize_payload(old, path)
         return {
-            "path": path,
+            "path": attrs.get("path", ""),
             "op": op,
             "line": line_arg,
             "count": count_arg,
@@ -1007,39 +946,14 @@ def extract_actions_in_order(model_text: str) -> List[Tuple[str, Any]]:
         if cmd:
             out.append((m.start(), seq, "command", cmd))
             seq += 1
-    used_edit_spans: List[Tuple[int, int]] = []
     search_from = 0
     for ed in extract_edits(model_text):
         raw = ed.get("raw") or ""
         idx = model_text.find(raw, search_from) if raw else -1
-        raw_len = len(raw)
-        while idx >= 0 and any(not (idx + max(raw_len, 1) <= s or idx >= e) for s, e in used_edit_spans):
-            idx = model_text.find(raw, idx + 1) if raw else -1
         if idx < 0 and raw:
             idx = model_text.find(raw)
-            while idx >= 0 and any(not (idx + max(raw_len, 1) <= s or idx >= e) for s, e in used_edit_spans):
-                idx = model_text.find(raw, idx + 1)
-        if idx < 0:
-            path = ed.get("path") or ""
-            op = ed.get("op") or ""
-            if path and op:
-                opener_re = re.compile(
-                    r"<edit\b(?=[^>]*\bpath\s*=\s*(['\"])" + re.escape(path) + r"\1)(?=[^>]*\bop\s*=\s*(['\"])" + re.escape(op) + r"\2)[^>]*>",
-                    re.IGNORECASE,
-                )
-                m = opener_re.search(model_text, search_from)
-                while m is not None and any(not (m.start() + 1 <= s or m.start() >= e) for s, e in used_edit_spans):
-                    m = opener_re.search(model_text, m.start() + 1)
-                if m is None:
-                    m = opener_re.search(model_text)
-                    while m is not None and any(not (m.start() + 1 <= s or m.start() >= e) for s, e in used_edit_spans):
-                        m = opener_re.search(model_text, m.start() + 1)
-                if m is not None:
-                    idx = m.start()
-                    raw_len = raw_len or 1
-        if idx >= 0:
-            used_edit_spans.append((idx, idx + max(raw_len, 1)))
-            search_from = idx + max(raw_len, 1)
+        if idx >= 0 and raw:
+            search_from = idx + len(raw)
         out.append((idx if idx >= 0 else len(model_text) + seq, seq, "edit", ed))
         seq += 1
     out.sort(key=lambda t: (t[0], t[1]))
@@ -1166,27 +1080,6 @@ def execute_edit(edit: Dict[str, Any], repo: Path) -> CommandResult:
             command=raw_cmd, stdout="", stderr=stderr,
             exit_code=1, duration_sec=time.monotonic() - t0, timed_out=False,
         )
-    def _normalize_value(value: str) -> str:
-        if not value:
-            return value
-        out_value = _maybe_unescape_code_entities(value, rel)
-        prev = None
-        for _ in range(3):
-            if out_value == prev:
-                break
-            prev = out_value
-            out_value = _strip_wrapping_code_fence(out_value, rel)
-        return out_value
-    def _candidate_texts(value: str) -> List[str]:
-        candidates: List[str] = []
-        for candidate in (
-            value,
-            value.strip("\n\r"),
-            value.strip(),
-        ):
-            if candidate and candidate not in candidates:
-                candidates.append(candidate)
-        return candidates
     rel = (edit.get("path") or "").lstrip("/")
     if not rel or ".." in Path(rel).parts:
         return _err(f"Invalid path: {edit.get('path')!r}")
@@ -1197,7 +1090,10 @@ def execute_edit(edit: Dict[str, Any], repo: Path) -> CommandResult:
     # still matches the real (unescaped) file content.
     for _k in ("content", "new", "old"):
         if edit.get(_k):
-            edit[_k] = _normalize_value(edit[_k])
+            edit[_k] = _maybe_unescape_code_entities(edit[_k], rel)
+    for _k in ("content", "new"):
+        if edit.get(_k):
+            edit[_k] = _strip_wrapping_code_fence(edit[_k], rel)
     try:
         if op == "write":
             content = edit.get("content") or ""
@@ -1210,20 +1106,21 @@ def execute_edit(edit: Dict[str, Any], repo: Path) -> CommandResult:
         if op == "replace":
             old = edit.get("old") or ""
             new = edit.get("new") or ""
-            if not old and edit.get("content"):
-                old = edit.get("content") or ""
-            if not new and edit.get("content") and old != (edit.get("content") or ""):
-                new = edit.get("content") or ""
             if not old:
                 return _err(
                     "Replace requires <old>. To create a new file or overwrite, "
                     "use op=\"write\" with <content>."
                 )
-            if new == old:
-                return _err(
-                    f"No changes made to {rel}. Replacement old and new text are identical."
-                )
-            ordered_candidates = _candidate_texts(old)
+            candidates = [old]
+            old_stripped = old.strip("\n\r")
+            if old_stripped and old_stripped != old:
+                candidates.append(old_stripped)
+            seen_candidates = set()
+            ordered_candidates = []
+            for candidate in candidates:
+                if candidate not in seen_candidates:
+                    seen_candidates.add(candidate)
+                    ordered_candidates.append(candidate)
             for candidate in ordered_candidates:
                 if candidate in src:
                     count = src.count(candidate)
@@ -1238,33 +1135,28 @@ def execute_edit(edit: Dict[str, Any], repo: Path) -> CommandResult:
                             f"No changes made to {rel}. Replacement produced identical content."
                         )
                     fp.write_text(out)
-                    suffix = "" if candidate == old else " after trimming surrounding whitespace"
+                    suffix = "" if candidate == old else " after trimming surrounding newlines"
                     return _ok(f"Replaced 1 occurrence in {rel}{suffix} ({len(src)} -> {len(out)} bytes)")
-            fuzzy_matches: List[Tuple[Tuple[int, int], str]] = []
+            located = None
             used_candidate = old
             for candidate in ordered_candidates:
                 located = _fuzzy_locate(src, candidate)
                 if located is not None:
-                    fuzzy_matches.append((located, candidate))
-            if not fuzzy_matches:
+                    used_candidate = candidate
+                    break
+            if located is None:
                 return _err(
                     f"Could not find the exact text in {rel}. Old text must "
                     "match including all whitespace and newlines."
                 )
-            unique_spans = {match[0] for match in fuzzy_matches}
-            if len(unique_spans) != 1:
-                return _err(
-                    f"Found multiple possible normalized matches for old text in {rel}; "
-                    "please provide more exact context."
-                )
-            (s, e), used_candidate = fuzzy_matches[0]
+            s, e = located
             out = src[:s] + new + src[e:]
             if out == src:
                 return _err(
                     f"No changes made to {rel}. Replacement produced identical content."
                 )
             fp.write_text(out)
-            suffix = "" if used_candidate == old else " after trimming surrounding whitespace"
+            suffix = "" if used_candidate == old else " after trimming surrounding newlines"
             return _ok(
                 f"Replaced 1 occurrence in {rel} via whitespace/quote-"
                 f"normalized match{suffix} ({len(src)} -> {len(out)} bytes). "
@@ -1288,46 +1180,19 @@ def execute_edit(edit: Dict[str, Any], repo: Path) -> CommandResult:
             return _ok(f"Inserted {len(new_lines)} line(s) at line {insert_at} in {rel}")
         if op == "delete":
             old = edit.get("old") or ""
-            if not old and edit.get("content"):
-                old = edit.get("content") or ""
             if old:
-                ordered_candidates = _candidate_texts(old)
-                for candidate in ordered_candidates:
-                    if candidate in src:
-                        count_found = src.count(candidate)
-                        if count_found > 1:
-                            return _err(
-                                f"Found {count_found} occurrences of old text in "
-                                f"{rel}; must be unique. Provide more context."
-                            )
-                        out = src.replace(candidate, "", 1)
-                        fp.write_text(out)
-                        suffix = "" if candidate == old else " after trimming surrounding whitespace"
-                        return _ok(f"Deleted 1 occurrence from {rel}{suffix} ({len(src)} -> {len(out)} bytes)")
-                fuzzy_matches: List[Tuple[Tuple[int, int], str]] = []
-                used_candidate = old
-                for candidate in ordered_candidates:
-                    located = _fuzzy_locate(src, candidate)
-                    if located is not None:
-                        fuzzy_matches.append((located, candidate))
-                if fuzzy_matches:
-                    unique_spans = {match[0] for match in fuzzy_matches}
-                    if len(unique_spans) != 1:
-                        return _err(
-                            f"Found multiple possible normalized matches for delete text in {rel}; "
-                            "please provide more exact context."
-                        )
-                    (s, e), used_candidate = fuzzy_matches[0]
-                    out = src[:s] + src[e:]
-                    fp.write_text(out)
-                    suffix = "" if used_candidate == old else " after trimming surrounding whitespace"
-                    return _ok(
-                        f"Deleted 1 occurrence from {rel} via whitespace/quote-"
-                        f"normalized match{suffix} ({len(src)} -> {len(out)} bytes). Verify the change."
+                if src.count(old) > 1:
+                    return _err(
+                        f"Found {src.count(old)} occurrences of old text in "
+                        f"{rel}; must be unique. Provide more context."
                     )
-                return _err(
-                    f"Could not find the exact text to delete in {rel}."
-                )
+                if old not in src:
+                    return _err(
+                        f"Could not find the exact text to delete in {rel}."
+                    )
+                out = src.replace(old, "", 1)
+                fp.write_text(out)
+                return _ok(f"Deleted 1 occurrence from {rel} ({len(src)} -> {len(out)} bytes)")
             line = edit.get("line", 0)
             count = edit.get("count", 1)
             if line <= 0 or count <= 0:
@@ -1961,11 +1826,6 @@ _SKELETON_INDEX_MAX_FILES = 220
 _SKELETON_READ_MAX_BYTES = 120_000
 _LOCALIZE_BM25_WEIGHT = 0.55
 _LOCALIZE_TFIDF_WEIGHT = 0.45
-# LEVER-1b weight: how strongly the deterministic _rank_context_files integer
-# score (path-mention/error-string/symbol-grep) is preserved through the
-# lexical rerank. 120 > loc's max 100 so a max-signal file (full path mention)
-# cannot be demoted below a pure-lexical distractor.
-_BASE_SCORE_RERANK_WEIGHT = 120.0
 _LOCALIZE_TOP_SYMBOLS_PER_FILE = 5
 _LOCALIZE_SYMBOL_CTX_BEFORE = 6
 _LOCALIZE_SYMBOL_CTX_AFTER = 18
@@ -2181,38 +2041,9 @@ def _extract_file_skeleton(repo: Path, relative_path: str) -> Optional[FileSkele
     return FileSkeleton(path=relative_path, symbols=symbols, index_text=index_text)
 
 
-def _build_repo_symbol_index(repo: Path, tracked: set, issue: Optional[str] = None) -> Dict[str, FileSkeleton]:
+def _build_repo_symbol_index(repo: Path, tracked: set) -> Dict[str, FileSkeleton]:
     index: Dict[str, FileSkeleton] = {}
-    allowed = [p for p in tracked if _context_file_allowed(p)]
-    if issue:
-        # LEVER-1a: fill the (fixed-size) skeleton budget RELEVANCE-FIRST instead
-        # of alphabetically. On repos with > _SKELETON_INDEX_MAX_FILES files the
-        # plain `sorted(...)[:N]` truncation drops every file sorting past N
-        # alphabetically -> those files get no skeleton -> no RAPTOR chunk -> are
-        # never preloaded -> guaranteed incompleteness on multi-file tasks. Ranking
-        # the allowed set by cheap issue-string relevance first (no skeletons
-        # needed, pure str ops) keeps the SAME budget/latency but guarantees
-        # issue-relevant files are among the indexed ones.
-        il = issue.lower()
-        toks = set(re.findall(r"[a-z0-9_]{3,}", il))
-
-        def _rel(p: str) -> int:
-            pl = p.lower()
-            nm = Path(p).name.lower()
-            st = Path(p).stem.lower()
-            r = 0
-            if pl in il:
-                r += 4
-            if nm and nm in il:
-                r += 3
-            if st and len(st) >= 3 and st in toks:
-                r += 2
-            return r
-
-        allowed = sorted(allowed, key=lambda p: (-_rel(p), p))
-    else:
-        allowed = sorted(allowed)
-    paths = allowed[:_SKELETON_INDEX_MAX_FILES]
+    paths = sorted(p for p in tracked if _context_file_allowed(p))[:_SKELETON_INDEX_MAX_FILES]
     for rel in paths:
         sk = _extract_file_skeleton(repo, rel)
         if sk:
@@ -2342,7 +2173,6 @@ def _multistep_localize_file_ranking(
     issue_text: str,
     base_ranked: List[str],
     index: Dict[str, FileSkeleton],
-    score_map: Optional[Dict[str, int]] = None,
 ) -> Tuple[List[str], int]:
     """Coarse file pass: BM25 + TF-IDF over symbol index, merged with base rank."""
     if not index or not base_ranked:
@@ -2353,27 +2183,11 @@ def _multistep_localize_file_ranking(
     bm25 = _normalize_score_map(_bm25_file_scores(qterms, index))
     tfidf = _normalize_score_map(_tfidf_cosine_file_scores(qterms, index))
     position: Dict[str, int] = {p: i for i, p in enumerate(base_ranked)}
-    # LEVER-1b: preserve the strong DETERMINISTIC ranking evidence from
-    # _rank_context_files (explicit path-mention +100, exact error-string up to
-    # +130, symbol-grep +60..100). The original rerank discarded it entirely and
-    # re-sorted on lexical loc + a position bonus that decays at 0.04/rank and
-    # FLOORS at rank 25 -> a lexically-similar distractor could leapfrog a file
-    # the issue explicitly names. Folding the normalized base score back in (as an
-    # additive term) keeps the high-signal files dominant. Pure arithmetic.
-    _max_base = 0
-    if score_map:
-        try:
-            _max_base = max(score_map.values())
-        except ValueError:
-            _max_base = 0
     combined: Dict[str, float] = {}
     for path in set(base_ranked) | set(index.keys()):
         loc = _LOCALIZE_BM25_WEIGHT * bm25.get(path, 0.0) + _LOCALIZE_TFIDF_WEIGHT * tfidf.get(path, 0.0)
         pos_bonus = max(0.0, 1.0 - 0.04 * position.get(path, 99))
-        base_term = 0.0
-        if _max_base > 0:
-            base_term = (score_map.get(path, 0) / _max_base) * _BASE_SCORE_RERANK_WEIGHT
-        combined[path] = loc * 100.0 + pos_bonus * 40.0 + base_term
+        combined[path] = loc * 100.0 + pos_bonus * 40.0
     ordered = sorted(combined.items(), key=lambda kv: (-kv[1], position.get(kv[0], 999), kv[0]))
     ranked = [p for p, _ in ordered if p in index or p in position]
     seen: set = set()
@@ -3325,7 +3139,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     except Exception:
         issue_symbols = []
     search_issue = issue if not issue_symbols else issue + '\n' + '\n'.join(issue_symbols)
-    symbol_index = _build_repo_symbol_index(repo, tracked_set, search_issue)
+    symbol_index = _build_repo_symbol_index(repo, tracked_set)
     _SOLVE_TLS.preload_frames = _extract_trace_frames(issue, tracked_set)
     fault_sites = list(_SOLVE_TLS.preload_frames)
     graph_nodes, graph_edges = _build_repo_graph(repo, symbol_index)
@@ -3667,12 +3481,7 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
         top_score = max(top_score, 100)
     idx = _get_symbol_index_for_ranking()
     if idx:
-        # LEVER-1b: thread the deterministic integer scores into the rerank so
-        # explicit path-mention / error-string / symbol-grep evidence survives.
-        _score_map: Dict[str, int] = {s_p[1]: s_p[0] for s_p in scored}
-        for _m in mentioned:
-            _score_map[_m] = max(_score_map.get(_m, 0), 100)
-        reranked, loc_top = _multistep_localize_file_ranking(issue, ranked, idx, _score_map)
+        reranked, loc_top = _multistep_localize_file_ranking(issue, ranked, idx)
         if reranked:
             ranked = reranked
             top_score = max(top_score, loc_top)
@@ -4253,6 +4062,77 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
         if not any(req == c or c.endswith("/" + req) for c in changed):
             missing.append(req)
     return missing
+
+
+def _detect_undership_vs_spec(patch: str, issue_text: str) -> Optional[str]:
+    """Loose-trigger undership hint: when the issue names multiple paths
+    and the patch covers fewer than ~70%, surface the gap as an explicit
+    "did you mean to omit?" prompt. Targets the dominant completeness-
+    deficit failure mode where the agent ships a partial patch that the
+    judge dings as "missing required files".
+
+    Returns a hint string or None. Format intentionally framed as a
+    question so the refinement loop interprets it as a coverage check
+    rather than a silent gate.
+    """
+    required = _extract_issue_path_mentions(issue_text)
+    if len(required) < 2:
+        return None
+    changed = set(_patch_changed_files(patch))
+    missing: List[str] = []
+    covered: List[str] = []
+    for req in required:
+        if any(req == c or c.endswith("/" + req) for c in changed):
+            covered.append(req)
+        else:
+            missing.append(req)
+    if not missing:
+        return None
+    # Loose threshold: fire when less than 70% covered. This catches the
+    # 16-of-45 partial-undership losses where the dominant rationale is
+    # "missing required files" without sacrificing focused single-file
+    # patches that legitimately concentrate work.
+    coverage = len(covered) / len(required)
+    if coverage >= 0.70:
+        return None
+    missing_str = ",".join(missing[:5])
+    covered_str = ",".join(covered[:5]) if covered else "(none)"
+    return (
+        f"undership_vs_spec: spec_lists={missing_str + ',' + covered_str};"
+        f" touched={covered_str}; if intentional omissions are correct"
+        f" leave the patch; otherwise expand coverage to: {missing_str}"
+    )
+
+
+def _detect_severe_undership(patch: str, issue_text: str) -> Optional[str]:
+    """Hard ship-blocker variant of undership: fires only on the
+    catastrophic case where the spec names many paths and the patch
+    covers almost none. This is the loss-mode where 'v9 ships SMALLER'
+    drops WR by 43pp. Routes through ship-blockers so the refinement
+    loop must address it before finalize.
+
+    Conservative: requires >=4 named paths AND coverage <30% AND the
+    patch is non-empty (an empty patch is caught upstream)."""
+    required = _extract_issue_path_mentions(issue_text)
+    if len(required) < 4:
+        return None
+    if not patch.strip():
+        return None
+    changed = set(_patch_changed_files(patch))
+    covered = sum(
+        1 for req in required
+        if any(req == c or c.endswith("/" + req) for c in changed)
+    )
+    if covered / len(required) >= 0.30:
+        return None
+    missing = [
+        req for req in required
+        if not any(req == c or c.endswith("/" + req) for c in changed)
+    ]
+    return (
+        f"severe_undership_vs_spec: spec_named={len(required)};"
+        f" patch_covers={covered}; uncovered={','.join(missing[:5])}"
+    )
 
 
 # -----------------------------
@@ -8698,26 +8578,7 @@ def build_lgxl_coverage_addendum(reasons: str) -> str:
         "Coverage strategy: cover as many of the implied required files as "
         "you can within budget. Each file's edit must contribute real "
         "functionality — never regress an existing file to an empty or "
-        "stub state.\n\n"
-        # LEVER-4 (anti-bug self-check): the dominant retest loss driver is
-        # COMPILE-FATAL correctness bugs INSIDE in-scope files that the
-        # sandbox's static gates miss (no node/tsc/go/rustc). Force a
-        # deterministic self-review using reads the model ALREADY does (grep/
-        # sed) — no new verification passes, no extra LLM round-trips.
-        "Correctness self-check — before <final>, re-read each file you "
-        "edited (you already grep/sed these) and verify, fixing any issue "
-        "in place: (a) it still PARSES in its own language — no "
-        "`async with open(...)` (open() is not an async context manager), no "
-        "duplicate/stray `[[package]]` or lockfile headers, no unbalanced "
-        "braces/tags, no stray duplicate `def`/`class`; (b) every module "
-        "path you import ACTUALLY EXISTS in the repo (confirm with grep) and "
-        "you did not break or rename an existing import; (c) you used the "
-        "EXACT identifiers, string literals, test-ids and column/field names "
-        "that already appear in the issue and surrounding code — never a "
-        "plausible synonym; (d) you did NOT add unrequested tests, "
-        "persistence, error templates, or .gitignore/lockfile churn the "
-        "issue did not ask for. This is verification, not removal: never "
-        "delete a correct edit.\n"
+        "stub state.\n"
     )
 
 
@@ -8911,6 +8772,15 @@ def _patch_ship_blockers(patch: str, issue: str) -> List[str]:
             "issue_named_test_untouched:"
             + ",".join(named_tests_missing[:4])
         )
+    # Severe undership: spec names many paths, patch covers <30%. Targets
+    # the dominant completeness-deficit failure mode (62% of v9-class
+    # losses, 43pp WR drop when challenger ships SMALLER than king).
+    try:
+        severe = _detect_severe_undership(patch, issue)
+        if severe:
+            blockers.append(severe)
+    except Exception:
+        pass
     return blockers
 
 
@@ -8942,6 +8812,16 @@ def _emit_patch_quality_hints(
     empties = _detect_empty_new_files(diff_text)
     if empties:
         hints.append("empty_new_files: " + ",".join(empties[:3]))
+    # Undership vs spec: explicit "did you mean to omit?" reprompt when the
+    # patch covers <70% of issue-named paths. Soft hint surfaces the gap to
+    # the refinement loop without ship-blocking; the loop can expand
+    # coverage or confirm the omissions are intentional.
+    try:
+        undership = _detect_undership_vs_spec(diff_text, task_brief)
+        if undership:
+            hints.append(undership)
+    except Exception:
+        pass
     return hints
 
 
@@ -10804,7 +10684,7 @@ If preloaded snippets show the target code, edit with `<edit>` immediately — d
 
 When multiple files need edits, include EVERY `<edit>` and `<command>` block needed in the SAME response. Do not split edits across turns.
 
-After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./pkg/foo -count=1`, etc.). Before you finish, confirm each edited file still parses and that every module path you import and every identifier/string/test-id you reference actually EXISTS in the repo (use the grep/sed reads you already do) — use the exact existing names, never a plausible synonym, and do not add churn the issue did not ask for. Then finish with <final>...</final>.{lgxl_addendum}"""
+After patching, run the most targeted test available (`pytest tests/test_X.py -x -q`, `go test ./pkg/foo -count=1`, etc.). Then finish with <final>...</final>.{lgxl_addendum}"""
 
 
 
@@ -12359,7 +12239,14 @@ def _patch_well_formed(patch: str) -> bool:
                 if bl.startswith("@@ ") or bl.startswith("diff --git "):
                     break
                 if bl == "":
-                    # trailing-newline artifact / blank — not a counted body line
+                    # Empty hunk-body line: git counts blank context lines toward
+                    # BOTH the `-count` and `+count` in the hunk header (a blank
+                    # context line appears in both old and new). Treating these as
+                    # context (oc+=1, nc+=1) rather than skipping fixes ~20% of
+                    # "_patch_well_formed disagrees with git" FP-voids on otherwise
+                    # git-acceptable patches.
+                    oc += 1
+                    nc += 1
                     j += 1
                     continue
                 if bl.startswith("+") and not bl.startswith("+++"):
@@ -14969,60 +14856,25 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         if len(winner_cluster) < 2 and len(candidates) >= 2:
             _winner_result["multishot_low_confidence"] = True
 
-        # LEVER-3 (tree-hygiene, never-empty): the original code UNCONDITIONALLY
-        # reverted the scored tree to base, then skipped the re-apply when the
-        # winner was empty/malformed -> a timeout-kill in/after that window
-        # collected an EMPTY 0-line diff and lost the both-timeout round
-        # (observed: retest 6452 shipped 3 empty partials = the dominant -9
-        # both-TLE deficit). Now: prepare the well-formed apply patch FIRST,
-        # only revert when we actually have one to re-apply, and if the apply
-        # leaves the tree empty, restore the best complete patch we held — so the
-        # scored tree is NEVER left empty without a successful re-apply.
-        # Latency-neutral: reorders existing ops, no repo copy.
         if _multishot_repo_obj is not None:
-            _apply_patch = _winner_patch or ""
-            if _apply_patch.strip():
-                try:
-                    _sanitized_patch = _sanitize_patch(_apply_patch)
-                    if _sanitized_patch.strip():
-                        _apply_patch = _sanitized_patch
-                except Exception:
-                    pass
-                try:
-                    if not _patch_well_formed(_apply_patch):
-                        _repaired_patch = _repair_hunk_header_counts(_apply_patch)
-                        if _repaired_patch.strip():
-                            _apply_patch = _repaired_patch
-                except Exception:
-                    pass
-            # floor: the complete patch already on the tree (last attempt).
-            _pre_revert_patch = ""
+            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+        if _winner_patch and _multishot_repo_obj is not None:
+            _apply_patch = _winner_patch
             try:
-                _pre_revert_patch = get_patch(_multishot_repo_obj) or ""
+                _sanitized_patch = _sanitize_patch(_apply_patch)
+                if _sanitized_patch.strip():
+                    _apply_patch = _sanitized_patch
             except Exception:
-                _pre_revert_patch = ""
-            if _apply_patch.strip() and _patch_well_formed(_apply_patch):
-                _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-                try:
-                    _multishot_apply_patch(_multishot_repo_obj, _apply_patch)
-                except Exception:
-                    pass
-                # never-empty guard: if the tree went empty the winner FAILED to
-                # apply, so restore the complete patch that was on the tree
-                # before (the floor) — NOT the winner (which just failed). Never
-                # leave the scored tree empty.
-                try:
-                    if not (get_patch(_multishot_repo_obj) or "").strip():
-                        if _pre_revert_patch.strip():
-                            _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-                            try:
-                                _multishot_apply_patch(_multishot_repo_obj, _pre_revert_patch)
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-            # else: no well-formed winner -> do NOT revert; keep the complete
-            # patch already on the tree so a kill never collects an empty diff.
+                pass
+            try:
+                if not _patch_well_formed(_apply_patch):
+                    _repaired_patch = _repair_hunk_header_counts(_apply_patch)
+                    if _repaired_patch.strip():
+                        _apply_patch = _repaired_patch
+            except Exception:
+                pass
+            if _patch_well_formed(_apply_patch):
+                _multishot_apply_patch(_multishot_repo_obj, _apply_patch)
 
         try:
             _augmented_patch = _coverage_closure_pass(
@@ -15683,23 +15535,12 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             response_text: Optional[str] = None
             for retry_attempt in range(MAX_STEP_RETRIES + 1):
                 try:
-                    # LEVER-2: clamp the per-step LLM timeout to the remaining
-                    # wall (minus reserve) so a late call can't run the default
-                    # 120s PAST the container hard-kill -> killed mid-stream ->
-                    # truncated/empty partial that loses the timeout race. On the
-                    # retest pool we timed out 30x vs king 23x and shipped 3
-                    # empty 0-line patches; bounding the call converts "killed
-                    # mid-overrun" into "graceful stop with a complete patch".
-                    # 20s floor so we never pass a too-small timeout that would
-                    # truncate a productive step.
-                    _step_timeout = int(max(20.0, min(120.0, time_remaining() - WALL_CLOCK_RESERVE_SECONDS)))
                     response_text, cost, _raw = chat_completion(
                         messages=_messages_for_request(messages),
                         model=model_name,
                         api_base=api_base,
                         api_key=api_key,
                         max_tokens=max_tokens,
-                        timeout=_step_timeout,
                     )
                     if cost is not None and total_cost is not None:
                         total_cost += cost
